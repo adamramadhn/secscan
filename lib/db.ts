@@ -14,6 +14,7 @@ export interface JobRow {
   severity_counts: string | null;
   share_token: string | null;
   validate: number;
+  auto_fix: number;
   status: string;
   progress: number;
   current_skill: string | null;
@@ -61,6 +62,15 @@ export interface FindingRow {
 export const SEVERITY_ORDER = ['Critical', 'High', 'Medium', 'Low', 'Info'] as const;
 export type Severity = (typeof SEVERITY_ORDER)[number];
 
+export interface FixRow {
+  id: number;
+  job_id: string;
+  file: string;
+  findings_json: string;
+  rationale: string | null;
+  created_at: number;
+}
+
 export interface CreateJobInput {
   repo_url: string;
   branch: string;
@@ -69,6 +79,7 @@ export interface CreateJobInput {
   depth?: string;
   instructions?: string | null;
   validate?: number;
+  auto_fix?: number;
 }
 
 export type JobPatch = Partial<
@@ -77,7 +88,7 @@ export type JobPatch = Partial<
 
 const JOB_COLUMNS = new Set([
   'repo_url', 'branch', 'target_type', 'skills_json', 'depth', 'instructions',
-  'severity_counts', 'share_token', 'validate',
+  'severity_counts', 'share_token', 'validate', 'auto_fix',
   'status', 'progress', 'current_skill', 'report_path', 'error',
 ]);
 
@@ -156,6 +167,7 @@ function migrate(db: Database.Database): void {
     severity_counts: "TEXT",
     share_token: "TEXT",
     validate: "INTEGER DEFAULT 0",
+    auto_fix: "INTEGER DEFAULT 0",
   };
   for (const [col, def] of Object.entries(colDefs)) {
     if (!jobCols.has(col)) {
@@ -187,6 +199,18 @@ function migrate(db: Database.Database): void {
   if (!fCols.has('validation_evidence')) {
     db.exec(`ALTER TABLE job_findings ADD COLUMN validation_evidence TEXT`);
   }
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS job_fixes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      job_id TEXT NOT NULL,
+      file TEXT NOT NULL,
+      findings_json TEXT NOT NULL DEFAULT '[]',
+      rationale TEXT,
+      created_at INTEGER NOT NULL,
+      FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_job_fixes_job ON job_fixes(job_id);
+  `);
 }
 
 export function createJob(input: CreateJobInput): JobRow {
@@ -194,9 +218,9 @@ export function createJob(input: CreateJobInput): JobRow {
   const now = Date.now();
   const id = uuidv4();
   db.prepare(
-    `INSERT INTO jobs (id, repo_url, branch, target_type, skills_json, depth, instructions, validate, status, progress, created_at, updated_at)
-     VALUES (@id, @repo_url, @branch, @target_type, @skills_json, @depth, @instructions, @validate, 'queued', 0, @now, @now)`
-  ).run({ id, ...input, depth: input.depth ?? 'medium', instructions: input.instructions ?? null, validate: input.validate ?? 0, now });
+    `INSERT INTO jobs (id, repo_url, branch, target_type, skills_json, depth, instructions, validate, auto_fix, status, progress, created_at, updated_at)
+     VALUES (@id, @repo_url, @branch, @target_type, @skills_json, @depth, @instructions, @validate, @auto_fix, 'queued', 0, @now, @now)`
+  ).run({ id, ...input, depth: input.depth ?? 'medium', instructions: input.instructions ?? null, validate: input.validate ?? 0, auto_fix: input.auto_fix ?? 0, now });
   return getJob(id)!;
 }
 
@@ -241,6 +265,10 @@ export function upsertJobSkill(jobId: string, skill: string, patch: JobSkillPatc
 
 export function getJobSkills(jobId: string): JobSkillRow[] {
   return getDb().prepare('SELECT * FROM job_skills WHERE job_id = ? ORDER BY rowid').all(jobId) as JobSkillRow[];
+}
+
+export function getJobFixes(jobId: string): FixRow[] {
+  return getDb().prepare('SELECT * FROM job_fixes WHERE job_id = ? ORDER BY rowid').all(jobId) as FixRow[];
 }
 
 export function getJobByShareToken(token: string): JobRow | null {

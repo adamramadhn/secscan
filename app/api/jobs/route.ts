@@ -21,6 +21,7 @@ interface JobBody {
   depth?: unknown;
   instructions?: unknown;
   validate?: unknown;
+  autoFix?: unknown;
   confirmOfensif?: unknown;
 }
 
@@ -61,6 +62,8 @@ export const POST = withAuth(async (req: Request) => {
 
   // Opsi validasi temuan (tahap 2 PoC-lite) — boolean.
   const validate = body.validate === true ? 1 : 0;
+  // Opsi auto-fix (tahap 3) — hanya target repo GitHub.
+  const autoFix = body.autoFix === true && targetType === 'github' ? 1 : 0;
 
   let repoUrl = '';
   let branch = 'main';
@@ -109,6 +112,7 @@ export const POST = withAuth(async (req: Request) => {
     depth,
     instructions,
     validate,
+    auto_fix: autoFix,
   });
 
   if (targetType === 'url') {

@@ -50,6 +50,7 @@ export default function NewScanPage() {
   const [depth, setDepth] = useState('medium');
   const [instructions, setInstructions] = useState('');
   const [validate, setValidate] = useState(false);
+  const [autoFix, setAutoFix] = useState(false);
   const isUrlMode = targetMode === 'url';
   const repoValid = isUrlMode ? repoUrl.trim().startsWith('http') : isValidGitHubUrl(repoUrl);
 
@@ -115,6 +116,7 @@ export default function NewScanPage() {
         instructions: instructions.trim() || null,
         targetType: targetMode,
         validate,
+        autoFix: !isUrlMode && autoFix,
         confirmOfensif: confirmed,
       });
       router.push(`/jobs/${jobId}`);
@@ -397,6 +399,33 @@ export default function NewScanPage() {
                     </span>
                   </span>
                 </label>
+
+                {!isUrlMode && (
+                  <label
+                    className={`flex cursor-pointer items-start gap-3 rounded-lg border p-3.5 transition ${
+                      autoFix
+                        ? 'border-emerald-500/50 bg-emerald-500/10'
+                        : 'border-zinc-800 bg-zinc-950 hover:border-zinc-700'
+                    }`}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={autoFix}
+                      onChange={(e) => setAutoFix(e.target.checked)}
+                      className="mt-0.5 h-4 w-4 rounded border-zinc-700 bg-zinc-900 accent-emerald-500"
+                    />
+                    <span className="flex flex-col gap-1">
+                      <span className={`text-sm font-semibold ${autoFix ? 'text-emerald-400' : 'text-zinc-200'}`}>
+                        Auto-Fix Patch
+                      </span>
+                      <span className="text-xs leading-relaxed text-zinc-500">
+                        Setelah validasi, perbaikan minimal diterapkan pada salinan repo dan hasilnya
+                        diunduh sebagai patch (git apply). Review tetap wajib sebelum diterapkan ke
+                        repo asli. Hanya untuk target repo GitHub.
+                      </span>
+                    </span>
+                  </label>
+                )}
               </div>
             )}
 
@@ -504,6 +533,12 @@ export default function NewScanPage() {
                     <span className="text-xs uppercase tracking-wide text-zinc-500">Validasi PoC</span>
                     <span className={`text-sm font-medium ${validate ? 'text-emerald-400' : 'text-zinc-500'}`}>
                       {validate ? 'Aktif' : 'Tidak'}
+                    </span>
+                  </div>
+                  <div className="flex items-start justify-between gap-4">
+                    <span className="text-xs uppercase tracking-wide text-zinc-500">Auto-Fix</span>
+                    <span className={`text-sm font-medium ${!isUrlMode && autoFix ? 'text-emerald-400' : 'text-zinc-500'}`}>
+                      {!isUrlMode && autoFix ? 'Aktif' : 'Tidak'}
                     </span>
                   </div>
                   {instructions.trim() && (

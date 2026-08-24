@@ -34,6 +34,7 @@ export interface Job {
   severity_counts: string | null;
   share_token: string | null;
   validate: number;
+  auto_fix: number;
   status: JobStatus;
   progress: number;
   current_skill: string | null;
@@ -70,10 +71,20 @@ export interface Finding {
   created_at: number;
 }
 
+export interface Fix {
+  id: number;
+  job_id: string;
+  file: string;
+  findings_json: string;
+  rationale: string | null;
+  created_at: number;
+}
+
 export interface JobDetail {
   job: Job;
   jobSkills: JobSkill[];
   findings: Finding[];
+  fixes?: Fix[];
 }
 
 export interface CreateJobBody {
@@ -86,6 +97,8 @@ export interface CreateJobBody {
   targetType?: 'github' | 'url';
   /** true → jalankan tahap 2 validasi temuan (PoC-lite). */
   validate?: boolean;
+  /** true → jalankan tahap 3 auto-fix (hanya target repo GitHub). */
+  autoFix?: boolean;
   confirmOfensif: boolean;
 }
 

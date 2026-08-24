@@ -24,6 +24,7 @@
 'use strict';
 
 const { spawn } = require('child_process');
+const { execFileSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
@@ -130,6 +131,7 @@ function migrate() {
   if (!cols.includes('severity_counts')) db.prepare("ALTER TABLE jobs ADD COLUMN severity_counts TEXT").run();
   if (!cols.includes('share_token')) db.prepare("ALTER TABLE jobs ADD COLUMN share_token TEXT").run();
   if (!cols.includes('validate')) db.prepare("ALTER TABLE jobs ADD COLUMN validate INTEGER DEFAULT 0").run();
+  if (!cols.includes('auto_fix')) db.prepare("ALTER TABLE jobs ADD COLUMN auto_fix INTEGER DEFAULT 0").run();
   db.exec(`
     CREATE TABLE IF NOT EXISTS job_findings (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -144,6 +146,16 @@ function migrate() {
       FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
     );
     CREATE INDEX IF NOT EXISTS idx_job_findings_job ON job_findings(job_id);
+    CREATE TABLE IF NOT EXISTS job_fixes (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      job_id TEXT NOT NULL,
+      file TEXT NOT NULL,
+      findings_json TEXT NOT NULL DEFAULT '[]',
+      rationale TEXT,
+      created_at INTEGER NOT NULL,
+      FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_job_fixes_job ON job_fixes(job_id);
   `);
   const fCols = db.prepare('PRAGMA table_info(job_findings)').all().map((c) => c.name);
   if (!fCols.includes('validation_status')) db.exec(`ALTER TABLE job_findings ADD COLUMN validation_status TEXT`);
@@ -157,7 +169,7 @@ function getJob(id) {
 
 function updateJob(id, patch) {
   const allowed = new Set(['repo_url', 'branch', 'target_type', 'skills_json', 'depth',
-    'instructions', 'severity_counts', 'share_token', 'validate',
+    'instructions', 'severity_counts', 'share_token', 'validate', 'auto_fix',
     'status', 'progress', 'current_skill', 'report_path', 'error']);
   const entries = Object.entries(patch).filter(([k, v]) => allowed.has(k) && v !== undefined);
   if (entries.length === 0) return getJob(id);
@@ -254,16 +266,18 @@ function buildTaskPrompt(skill, depth, workDir, instructions, targetUrl) {
 }
 
 /**
- * @returns {Promise<{status: 'done'|'failed', output: string}>}
+ * Runner hermes generik (dipakai skill scan, validator, dan fixer).
+ * @param {{prompt: string, skill: string|null, workDir: string, label: string,
+ *          timeoutMs?: number}} opts
+ * @returns {Promise<{status:'done'|'failed', output: string}>}
  */
-function runSkill(skill, workDir, depth, instructions, targetUrl) {
+function runHermes({ prompt, skill, workDir, label, timeoutMs }) {
+  const args = ['-z', prompt, '--in', workDir, '--safe-mode'];
+  if (skill) args.splice(2, 0, '-s', skill);
+  const env = { ...process.env, PATH: `${HERMES_PATH}:${process.env.PATH ?? ''}` };
+  const timeout = timeoutMs ?? RUN_TIMEOUT_MS;
+  console.log(`[worker] spawn hermes -z "<TASK>"${skill ? ` -s ${skill}` : ''} --in ${workDir} --safe-mode (timeout ${timeout}ms) [${label}]`);
   return new Promise((resolve) => {
-    const taskPrompt = buildTaskPrompt(skill, depth, workDir, instructions, targetUrl);
-    const args = ['-z', taskPrompt, '-s', skill, '--in', workDir, '--safe-mode'];
-    const env = { ...process.env, PATH: `${HERMES_PATH}:${process.env.PATH ?? ''}` };
-
-    console.log(`[worker] spawn hermes -z "<TASK>" -s ${skill} --in ${workDir} --safe-mode (timeout ${RUN_TIMEOUT_MS}ms)`);
-
     let child;
     try {
       child = spawn(HERMES_BIN, args, {
@@ -291,7 +305,6 @@ function runSkill(skill, workDir, depth, instructions, targetUrl) {
 
     child.stdout.on('data', (chunk) => {
       stdout = Buffer.concat([stdout, chunk]);
-      // batasi akumulasi memori — simpan cukup untuk head+tail
       if (stdout.length > OUTPUT_LIMIT * 4) stdout = stdout.subarray(stdout.length - OUTPUT_LIMIT * 4);
     });
     child.stderr.on('data', (chunk) => {
@@ -301,13 +314,13 @@ function runSkill(skill, workDir, depth, instructions, targetUrl) {
 
     const timeoutId = setTimeout(() => {
       if (settled) return;
-      console.log(`[worker] TIMEOUT ${RUN_TIMEOUT_MS}ms untuk hermes (${skill}) — SIGTERM`);
+      console.log(`[worker] TIMEOUT ${timeout}ms untuk hermes (${label}) — SIGTERM`);
       killedByTimeout = true;
       try { child.kill('SIGTERM'); } catch { /* ignore */ }
       killTimer = setTimeout(() => {
         try { child.kill('SIGKILL'); } catch { /* ignore */ }
       }, KILL_GRACE_MS);
-    }, RUN_TIMEOUT_MS);
+    }, timeout);
 
     child.on('error', (err) => {
       finish('failed', `[spawn error] ${err.message}`);
@@ -317,7 +330,7 @@ function runSkill(skill, workDir, depth, instructions, targetUrl) {
       clearTimeout(timeoutId);
       const combined = Buffer.concat([stdout, Buffer.from('\n'), stderr]).toString('utf8');
       if (killedByTimeout) {
-        finish('failed', `TIMEOUT setelah ${RUN_TIMEOUT_MS / 60000} menit.\n${combined}`);
+        finish('failed', `TIMEOUT setelah ${timeout / 60000} menit.\n${combined}`);
         return;
       }
       if (code === 0) {
@@ -328,6 +341,14 @@ function runSkill(skill, workDir, depth, instructions, targetUrl) {
       }
     });
   });
+}
+
+/**
+ * @returns {Promise<{status: 'done'|'failed', output: string}>}
+ */
+function runSkill(skill, workDir, depth, instructions, targetUrl) {
+  const taskPrompt = buildTaskPrompt(skill, depth, workDir, instructions, targetUrl);
+  return runHermes({ prompt: taskPrompt, skill, workDir, label: skill });
 }
 
 /* ------------------------------------------------------------------ */
@@ -559,58 +580,7 @@ function buildValidatorPrompt(findings, workDir, targetUrl) {
  */
 function runValidator(findings, workDir, targetUrl) {
   const taskPrompt = buildValidatorPrompt(findings, workDir, targetUrl);
-  const args = ['-z', taskPrompt, '--in', workDir, '--safe-mode'];
-  const env = { ...process.env, PATH: `${HERMES_PATH}:${process.env.PATH ?? ''}` };
-  return new Promise((resolve) => {
-    let child;
-    try {
-      child = spawn(HERMES_BIN, args, { cwd: workDir, env, stdio: ['ignore', 'pipe', 'pipe'] });
-    } catch (err) {
-      resolve({ status: 'failed', output: `spawn_error: ${err.message}` });
-      return;
-    }
-    let stdout = Buffer.alloc(0);
-    let stderr = Buffer.alloc(0);
-    let settled = false;
-    let killedByTimeout = false;
-    let killTimer = null;
-    const finish = (status, output) => {
-      if (settled) return;
-      settled = true;
-      if (killTimer) clearTimeout(killTimer);
-      resolve({ status, output: truncateOutput(output) });
-    };
-    child.stdout.on('data', (c) => {
-      stdout = Buffer.concat([stdout, c]);
-      if (stdout.length > OUTPUT_LIMIT * 4) stdout = stdout.subarray(stdout.length - OUTPUT_LIMIT * 4);
-    });
-    child.stderr.on('data', (c) => {
-      stderr = Buffer.concat([stderr, c]);
-      if (stderr.length > OUTPUT_LIMIT * 4) stderr = stderr.subarray(stderr.length - OUTPUT_LIMIT * 4);
-    });
-    const timeoutId = setTimeout(() => {
-      if (settled) return;
-      killedByTimeout = true;
-      try { child.kill('SIGTERM'); } catch { /* ignore */ }
-      killTimer = setTimeout(() => {
-        try { child.kill('SIGKILL'); } catch { /* ignore */ }
-      }, KILL_GRACE_MS);
-    }, RUN_TIMEOUT_MS);
-    child.on('error', (err) => finish('failed', `[spawn error] ${err.message}`));
-    child.on('close', (code, signal) => {
-      clearTimeout(timeoutId);
-      const combined = Buffer.concat([stdout, Buffer.from('\n'), stderr]).toString('utf8');
-      if (killedByTimeout) {
-        finish('failed', `TIMEOUT setelah ${RUN_TIMEOUT_MS / 60000} menit.\n${combined}`);
-        return;
-      }
-      if (code === 0) finish('done', combined);
-      else {
-        const why = signal ? ` killed by signal ${signal}` : '';
-        finish('failed', `exit code ${code}${why}\n${combined}`);
-      }
-    });
-  });
+  return runHermes({ prompt: taskPrompt, skill: null, workDir, label: 'validator-poc' });
 }
 
 /** Ambil temuan job yang layak divalidasi (non-Info, max 25, urut severity). */
@@ -641,6 +611,113 @@ function applyValidation(jobId, items) {
   tx(items);
 }
 
+/* ------------------------------------------------------------------ */
+/* Tahap 3: auto-fix (perbaikan minimal + patch)                        */
+/* ------------------------------------------------------------------ */
+
+const MAX_FIX_FINDINGS = 10;
+
+/** Parser metadata fix per file (port dari lib/fixes.ts). */
+function parseFixesOutput(output) {
+  if (!output) return [];
+  const blocks = [...String(output).matchAll(/```json\s*([\s\S]*?)```/g)];
+  for (let i = blocks.length - 1; i >= 0; i--) {
+    let parsed;
+    try {
+      parsed = JSON.parse(blocks[i][1]);
+    } catch {
+      continue;
+    }
+    if (!Array.isArray(parsed)) continue;
+    const items = parsed
+      .filter((x) => x && typeof x === 'object' && typeof x.file === 'string' && x.file.trim().length > 0)
+      .map((x) => ({
+        file: String(x.file).slice(0, 500),
+        findings: Array.isArray(x.findings)
+          ? x.findings.filter((n) => Number.isInteger(n)).slice(0, 50)
+          : [],
+        rationale: typeof x.rationale === 'string' ? x.rationale.slice(0, 2000) : null,
+      }));
+    if (items.length > 0) return items;
+  }
+  return [];
+}
+
+/** Prompt fixer: terapkan perbaikan minimal untuk daftar temuan. */
+function buildFixerPrompt(findings, workDir) {
+  const list = findings
+    .map((f) =>
+      `- id=${f.id} [${f.severity}] ${f.title}\n  deskripsi: ${(f.description ?? '').slice(0, 500)}\n  lokasi: ${f.location ?? '—'}\n  rekomendasi auditor: ${(f.recommendation ?? f.validation_evidence ?? '').slice(0, 500)}`
+    )
+    .join('\n');
+  return (
+    `Kamu adalah engineer keamanan senior yang menulis perbaikan kode minimal dan aman. ` +
+    `Repositori target sudah di-clone di ${workDir}. Terapkan perbaikan MINIMAL untuk tiap temuan di bawah ini ` +
+    `(satu perubahan sekecil mungkin yang menutup temuan — jangan refactor, jangan restyle, jangan sentuh hal lain):\n` +
+    `- Prioritaskan: temuan terkonfirmasi validasi, lalu severity tertinggi.\n` +
+    `- Hanya file yang relevan dengan temuan. Jangan menambah dependensi baru kecuali benar-benar wajib.\n` +
+    `- Jika temuan tidak bisa diperbaiki dengan suntingan kode (mis. butuh konfigurasi infra), LEWATI dan jangan dipaksakan.\n` +
+    `DAFTAR TEMUAN:\n${list}\n\n` +
+    `Setelah selesai mengedit, WAJIB akhiri jawaban dengan blok json array — satu objek per file yang kamu ubah:\n` +
+    '```json\n[{"file": "<path relatif>", "findings": [<id temuan yang ditutup>], "rationale": "<kenapa perubahan ini menutup temuan>"}]\n```\n' +
+    `Jangan commit; biarkan perubahan sebagai working-tree diff.`
+  );
+}
+
+/** Jalankan hermes fixer (boleh menulis file di workdir). */
+function runFixer(findings, workDir) {
+  const taskPrompt = buildFixerPrompt(findings, workDir);
+  return runHermes({ prompt: taskPrompt, skill: null, workDir, label: 'auto-fix' });
+}
+
+/** Capture git diff workdir (unified, termasuk file baru untracked). */
+function captureGitDiff(workDir) {
+  try {
+    execFileSync('git', ['-C', workDir, 'add', '-A', '-N'], { stdio: 'ignore', timeout: 30_000 });
+    const diff = execFileSync('git', ['-C', workDir, 'diff'], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: 60_000 });
+    return diff.trim();
+  } catch (err) {
+    console.error('[worker] captureGitDiff gagal:', err?.message ?? err);
+    return null;
+  }
+}
+
+/** Simpan metadata fix + patch ke DB/disk. */
+function persistFixes(jobId, fixMetas, patchText) {
+  const dir = path.join(REPORT_DIR, jobId);
+  fs.mkdirSync(dir, { recursive: true });
+  const stmt = db.prepare(
+    'INSERT INTO job_fixes (job_id, file, findings_json, rationale, created_at) VALUES (?, ?, ?, ?, ?)'
+  );
+  const tx = db.transaction((metas) => {
+    for (const m of metas) {
+      stmt.run(jobId, m.file, JSON.stringify(m.findings), m.rationale, Date.now());
+    }
+  });
+  tx(fixMetas);
+  if (patchText) {
+    fs.writeFileSync(path.join(dir, 'fixes.patch'), patchText, 'utf8');
+    return path.join(dir, 'fixes.patch');
+  }
+  return null;
+}
+
+/** Ambil temuan yang layak difix (confirmed dulu bila ada, sisanya non-Info, max 10). */
+function getEligibleFixFindings(jobId) {
+  const rows = db
+    .prepare(
+      `SELECT id, severity, title, description, location, recommendation, validation_status, validation_evidence
+       FROM job_findings
+       WHERE job_id = ? AND severity != 'Info' AND (validation_status IS NULL OR validation_status != 'refuted')
+       ORDER BY CASE WHEN validation_status = 'confirmed' THEN 0 ELSE 1 END,
+         CASE severity WHEN 'Critical' THEN 0 WHEN 'High' THEN 1 WHEN 'Medium' THEN 2 WHEN 'Low' THEN 3 ELSE 4 END,
+         id
+       LIMIT ${MAX_FIX_FINDINGS}`
+    )
+    .all(jobId);
+  return rows;
+}
+
 /** Simpan temuan hasil parse ke job_findings + update severity_counts job. */
 function persistFindings(jobId, skill, parsed) {
   if (!parsed.length) return;
@@ -663,7 +740,7 @@ function persistFindings(jobId, skill, parsed) {
 /* Report                                                                 */
 /* ------------------------------------------------------------------ */
 
-function buildReport(job, skillResults, finalStatus, allFindings, validationInfo) {
+function buildReport(job, skillResults, finalStatus, allFindings, validationInfo, fixInfo) {
   const lines = [];
   const counts = countSeverities(allFindings);
   const totalFindings = allFindings.length;
@@ -725,6 +802,34 @@ function buildReport(job, skillResults, finalStatus, allFindings, validationInfo
     }
   }
 
+  // Ringkasan auto-fix (tahap 3) bila dijalankan.
+  if (fixInfo) {
+    lines.push('# Auto-Fix Patch');
+    lines.push('');
+    if (fixInfo.status === 'done') {
+      lines.push(`**${fixInfo.files}** file diubah — patch tersimpan sebagai \`fixes.patch\` (dapat di-apply dengan \`git apply\`).`);
+      lines.push('');
+      const fixRows = fixInfo.fixRows ?? [];
+      if (fixRows.length > 0) {
+        lines.push('| File | Temuan ditutup | Alasan |');
+        lines.push('|---|---|---|');
+        const esc = (s) => String(s ?? '').replace(/\|/g, '\\|').replace(/\r?\n/g, ' ');
+        for (const r of fixRows) {
+          let ids = r.findings_json;
+          try { ids = JSON.parse(r.findings_json).join(', '); } catch { /* biarkan */ }
+          lines.push(`| \`${esc(r.file)}\` | ${ids} | ${esc(r.rationale).slice(0, 200)} |`);
+        }
+        lines.push('');
+      }
+    } else if (fixInfo.status === 'skipped') {
+      lines.push(`Dilewati (${fixInfo.reason === 'url_target' ? 'target URL live tidak punya kode untuk diperbaiki' : 'tidak ada temuan yang layak diperbaiki'}).`);
+      lines.push('');
+    } else {
+      lines.push(`Gagal: ${fixInfo.reason ?? 'unknown'}. Temuan tetap dilaporkan tanpa patch.`);
+      lines.push('');
+    }
+  }
+
   if (job.instructions && job.instructions.trim()) {
     lines.push('# Instruksi Operator');
     lines.push('');
@@ -749,7 +854,7 @@ function buildReport(job, skillResults, finalStatus, allFindings, validationInfo
   return lines.join('\n');
 }
 
-function writeReport(job, skillResults, finalStatus, allFindings, validationInfo) {
+function writeReport(job, skillResults, finalStatus, allFindings, validationInfo, fixInfo) {
   const dir = path.join(REPORT_DIR, job.id);
   fs.mkdirSync(dir, { recursive: true });
   const reportPath = path.join(dir, 'report.md');
@@ -765,7 +870,19 @@ function writeReport(job, skillResults, finalStatus, allFindings, validationInfo
       enriched = validationInfo; // biarkan tanpa rows
     }
   }
-  fs.writeFileSync(reportPath, buildReport(job, skillResults, finalStatus, allFindings, enriched), 'utf8');
+  // Baca ulang metadata fix dari DB bila ada.
+  let fixEnriched = fixInfo;
+  if (fixInfo && fixInfo.status === 'done') {
+    try {
+      const frows = db
+        .prepare('SELECT file, findings_json, rationale FROM job_fixes WHERE job_id = ? ORDER BY rowid')
+        .all(job.id);
+      fixEnriched = { ...fixInfo, fixRows: frows };
+    } catch {
+      fixEnriched = fixInfo;
+    }
+  }
+  fs.writeFileSync(reportPath, buildReport(job, skillResults, finalStatus, allFindings, enriched, fixEnriched), 'utf8');
   console.log(`[worker] report ditulis: ${reportPath}`);
   return reportPath;
 }
@@ -902,6 +1019,51 @@ async function processJob(bullJob) {
     }
   }
 
+  // ——— Tahap 3: auto-fix (hanya target repo) ———
+  let fixInfo = null;
+  if (Number(job.auto_fix) === 1 && allDone && job.target_type === 'github') {
+    const eligible = getEligibleFixFindings(jobId);
+    if (eligible.length === 0) {
+      console.log(`[worker] job ${jobId} — auto-fix dilewati (tidak ada temuan yang layak)`);
+      fixInfo = { status: 'skipped', reason: 'no_findings', files: 0 };
+    } else {
+      console.log(`[worker] job ${jobId} — tahap auto-fix: ${eligible.length} temuan kandidat`);
+      updateJob(jobId, { status: 'running', current_skill: 'auto-fix' });
+      let fixResult;
+      try {
+        fixResult = await runFixer(eligible, workDir);
+      } catch (err) {
+        fixResult = { status: 'failed', output: `internal_error: ${err.message}` };
+      }
+      if (fixResult.status === 'done') {
+        const metas = parseFixesOutput(fixResult.output);
+        const patchText = captureGitDiff(workDir);
+        if (metas.length > 0 && patchText && patchText.length > 0) {
+          try {
+            const patchPath = persistFixes(jobId, metas, patchText);
+            console.log(`[worker] job ${jobId} — auto-fix selesai: ${metas.length} file diubah, patch ${patchText.length} byte → ${patchPath}`);
+            fixInfo = { status: 'done', files: metas.length, patch_path: patchPath, patch_bytes: patchText.length };
+          } catch (err) {
+            console.error(`[worker] job ${jobId} — gagal persist fixes:`, err?.message ?? err);
+            fixInfo = { status: 'failed', reason: err?.message ?? 'persist_error', files: 0 };
+          }
+        } else if (metas.length === 0 && (!patchText || patchText.length === 0)) {
+          console.log(`[worker] job ${jobId} — fixer tidak mengubah apa pun (tidak ada fix yang layak)`);
+          fixInfo = { status: 'skipped', reason: 'no_changes', files: 0 };
+        } else {
+          console.log(`[worker] job ${jobId} — auto-fix inkonsisten (metas=${metas.length}, patch=${patchText ? patchText.length : 0} byte) — diff tetap disimpan bila ada`);
+          fixInfo = { status: 'failed', reason: 'inconsistent', files: metas.length };
+        }
+      } else {
+        console.log(`[worker] job ${jobId} — fixer gagal: ${(fixResult.output ?? '').slice(0, 200)}`);
+        fixInfo = { status: 'failed', reason: 'fixer_failed', files: 0 };
+      }
+    }
+  } else if (Number(job.auto_fix) === 1 && allDone && job.target_type !== 'github') {
+    console.log(`[worker] job ${jobId} — auto-fix tidak tersedia untuk target URL live`);
+    fixInfo = { status: 'skipped', reason: 'url_target', files: 0 };
+  }
+
   // Share token: generate saat job terminal dengan report (untuk link /r/<token>).
   if (!job.share_token) {
     try {
@@ -913,7 +1075,7 @@ async function processJob(bullJob) {
 
   if (allDone) {
     const freshJob = getJob(jobId);
-    const reportPath = writeReport(freshJob ?? job, skillResults, 'done', allFindings, validationInfo);
+    const reportPath = writeReport(freshJob ?? job, skillResults, 'done', allFindings, validationInfo, fixInfo);
     updateJob(jobId, { status: 'done', progress: 100, report_path: reportPath, current_skill: null });
     addAudit('job_done', jobId);
     console.log(`[worker] job ${jobId} SELESAI (done), report: ${reportPath}`);

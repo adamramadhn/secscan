@@ -11,10 +11,12 @@ import {
   Job,
   JobSkill,
   Finding,
+  Fix,
 } from '@/lib/api';
 import StatusBadge from '@/components/StatusBadge';
 import Progress from '@/components/Progress';
 import FindingsPanel from '@/components/FindingsPanel';
+import FixesPanel from '@/components/FixesPanel';
 
 function relativeTime(ts: number): string {
   const diff = Math.max(0, Date.now() - ts);
@@ -41,16 +43,18 @@ export default function JobDetailPage() {
   const [job, setJob] = useState<Job | null>(null);
   const [jobSkills, setJobSkills] = useState<JobSkill[]>([]);
   const [findings, setFindings] = useState<Finding[]>([]);
+  const [fixes, setFixes] = useState<Fix[]>([]);
   const [notFound, setNotFound] = useState(false);
   const [loading, setLoading] = useState(true);
   const [live, setLive] = useState(false);
   const [copied, setCopied] = useState(false);
 
   // Sinkronkan state dari snapshot { job, jobSkills, findings }.
-  const applySnapshot = useCallback((data: { job: Job; jobSkills: JobSkill[]; findings?: Finding[] }) => {
+  const applySnapshot = useCallback((data: { job: Job; jobSkills: JobSkill[]; findings?: Finding[]; fixes?: Fix[] }) => {
     setJob(data.job);
     setJobSkills(data.jobSkills);
     setFindings(data.findings ?? []);
+    setFixes(data.fixes ?? []);
     setLoading(false);
     setNotFound(false);
   }, []);
@@ -284,6 +288,7 @@ export default function JobDetailPage() {
 
         {/* Temuan terstruktur (muncul live saat skill selesai) */}
         <FindingsPanel findings={findings} />
+        {fixes.length > 0 && <FixesPanel fixes={fixes} jobId={id} />}
 
         {/* Daftar skill */}
         <div className="flex flex-col gap-3">
