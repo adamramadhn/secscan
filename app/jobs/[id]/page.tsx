@@ -221,7 +221,12 @@ export default function JobDetailPage() {
               <div className="flex flex-wrap items-center gap-2 text-xs text-zinc-500">
                 {job.target_type === 'url' && (
                   <span className="rounded-md border border-red-500/30 bg-red-500/10 px-2 py-0.5 font-medium text-red-300">
-                    URL Live
+                    LIVE URL
+                  </span>
+                )}
+                {job.target_type === 'github' && job.diff_base && (
+                  <span className="rounded-md border border-sky-500/30 bg-sky-500/10 px-2 py-0.5 font-medium text-sky-300">
+                    DIFF-SCOPE vs {job.diff_base}
                   </span>
                 )}
                 {job.target_type !== 'url' && (

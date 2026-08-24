@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import { withAuth } from '@/lib/require-auth';
-import { cloneRepo, isValidGithubUrl } from '@/lib/clone';
+import { cloneRepo, isValidGithubUrl, isValidDiffBase } from '@/lib/clone';
 import { isValidLiveUrl } from '@/lib/target';
 import { enqueueScan } from '@/lib/jobs';
 import { getSkill } from '@/lib/skills';
@@ -22,6 +22,7 @@ interface JobBody {
   instructions?: unknown;
   validate?: unknown;
   autoFix?: unknown;
+  diffBase?: unknown;
   confirmOfensif?: unknown;
 }
 
@@ -64,6 +65,16 @@ export const POST = withAuth(async (req: Request) => {
   const validate = body.validate === true ? 1 : 0;
   // Opsi auto-fix (tahap 3) — hanya target repo GitHub.
   const autoFix = body.autoFix === true && targetType === 'github' ? 1 : 0;
+
+  // Diff-scope: base ref (branch/SHA/tag) untuk review pre-merge — hanya repo GitHub.
+  let diffBase: string | null = null;
+  if (targetType === 'github' && typeof body.diffBase === 'string' && body.diffBase.trim()) {
+    const candidate = body.diffBase.trim();
+    if (!isValidDiffBase(candidate)) {
+      return NextResponse.json({ error: 'invalid_diff_base' }, { status: 400 });
+    }
+    diffBase = candidate;
+  }
 
   let repoUrl = '';
   let branch = 'main';
@@ -113,6 +124,7 @@ export const POST = withAuth(async (req: Request) => {
     instructions,
     validate,
     auto_fix: autoFix,
+    diff_base: diffBase,
   });
 
   if (targetType === 'url') {

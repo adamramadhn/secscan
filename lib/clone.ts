@@ -26,6 +26,20 @@ export function isValidGithubUrl(url: string): boolean {
   return GITHUB_URL_RE.test(url);
 }
 
+/** URL PR GitHub: https://github.com/<owner>/<repo>/pull/<n> */
+export const PR_URL_RE = /^https:\/\/github\.com\/([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)\/pull\/(\d+)\/?$/;
+
+/**
+ * Validasi ref base diff-scope (branch / SHA / tag).
+ * Charset ketat + tanpa '..'/'@' — aman dilempar ke execFile tanpa shell.
+ */
+export function isValidDiffBase(ref: string): boolean {
+  if (typeof ref !== 'string') return false;
+  const s = ref.trim();
+  if (s.length === 0 || s.length > 200) return false;
+  return /^[A-Za-z0-9._/-]+$/.test(s) && !s.includes('..') && !s.includes('@');
+}
+
 /**
  * Clone repo publik dengan shallow clone (--depth 1) ke destDir.
  * Branch kosong → default 'main'.

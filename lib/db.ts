@@ -80,6 +80,7 @@ export interface CreateJobInput {
   instructions?: string | null;
   validate?: number;
   auto_fix?: number;
+  diff_base?: string | null;
 }
 
 export type JobPatch = Partial<
@@ -168,6 +169,7 @@ function migrate(db: Database.Database): void {
     share_token: "TEXT",
     validate: "INTEGER DEFAULT 0",
     auto_fix: "INTEGER DEFAULT 0",
+    diff_base: "TEXT",
   };
   for (const [col, def] of Object.entries(colDefs)) {
     if (!jobCols.has(col)) {
@@ -218,9 +220,9 @@ export function createJob(input: CreateJobInput): JobRow {
   const now = Date.now();
   const id = uuidv4();
   db.prepare(
-    `INSERT INTO jobs (id, repo_url, branch, target_type, skills_json, depth, instructions, validate, auto_fix, status, progress, created_at, updated_at)
-     VALUES (@id, @repo_url, @branch, @target_type, @skills_json, @depth, @instructions, @validate, @auto_fix, 'queued', 0, @now, @now)`
-  ).run({ id, ...input, depth: input.depth ?? 'medium', instructions: input.instructions ?? null, validate: input.validate ?? 0, auto_fix: input.auto_fix ?? 0, now });
+    `INSERT INTO jobs (id, repo_url, branch, target_type, skills_json, depth, instructions, validate, auto_fix, diff_base, status, progress, created_at, updated_at)
+     VALUES (@id, @repo_url, @branch, @target_type, @skills_json, @depth, @instructions, @validate, @auto_fix, @diff_base, 'queued', 0, @now, @now)`
+  ).run({ ...input, id, now, depth: input.depth ?? 'medium', instructions: input.instructions ?? null, validate: input.validate ?? 0, auto_fix: input.auto_fix ?? 0, diff_base: input.diff_base ?? null });
   return getJob(id)!;
 }
 

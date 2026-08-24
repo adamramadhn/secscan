@@ -132,6 +132,7 @@ function migrate() {
   if (!cols.includes('share_token')) db.prepare("ALTER TABLE jobs ADD COLUMN share_token TEXT").run();
   if (!cols.includes('validate')) db.prepare("ALTER TABLE jobs ADD COLUMN validate INTEGER DEFAULT 0").run();
   if (!cols.includes('auto_fix')) db.prepare("ALTER TABLE jobs ADD COLUMN auto_fix INTEGER DEFAULT 0").run();
+  if (!cols.includes('diff_base')) db.prepare("ALTER TABLE jobs ADD COLUMN diff_base TEXT").run();
   db.exec(`
     CREATE TABLE IF NOT EXISTS job_findings (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -169,7 +170,7 @@ function getJob(id) {
 
 function updateJob(id, patch) {
   const allowed = new Set(['repo_url', 'branch', 'target_type', 'skills_json', 'depth',
-    'instructions', 'severity_counts', 'share_token', 'validate', 'auto_fix',
+    'instructions', 'severity_counts', 'share_token', 'validate', 'auto_fix', 'diff_base',
     'status', 'progress', 'current_skill', 'report_path', 'error']);
   const entries = Object.entries(patch).filter(([k, v]) => allowed.has(k) && v !== undefined);
   if (entries.length === 0) return getJob(id);
@@ -220,9 +221,17 @@ function truncateOutput(raw) {
 /* runSkill: spawn `hermes -z <TASK> -s <skill> --in <workDir> --safe-mode` */
 /* ------------------------------------------------------------------ */
 
-function buildTaskPrompt(skill, depth, workDir, instructions, targetUrl) {
+function buildTaskPrompt(skill, depth, workDir, instructions, targetUrl, diffScope) {
   const extra = instructions && instructions.trim()
     ? `Instruksi khusus dari operator (WAJIB diikuti): ${instructions.trim()} `
+    : '';
+  const diffScopePart = diffScope
+    ? `MODE DIFF-SCOPE: ini adalah review pre-merge yang CEPAT dan TERFOKUS. ` +
+      `File yang berubah tersimpan di <workDir>/secscan-changed.txt (daftar) dan ` +
+      `<workDir>/secscan-diff.patch (diff unified penuh vs ${diffScope.base}). ` +
+      `Analisis HANYA perubahan tersebut: baca file yang berubah secara utuh bila perlu untuk konteks, ` +
+      `tapi temuan yang tidak berhubungan dengan diff ini DI LUAR SCOPE — jangan dilaporkan. ` +
+      `Kedalaman analisis: 'light' efektif. `
     : '';
   const findingFormat =
     `Format setiap temuan WAJIB konsisten agar bisa diparse otomatis: ` +
@@ -253,6 +262,7 @@ function buildTaskPrompt(skill, depth, workDir, instructions, targetUrl) {
     `Kamu adalah auditor keamanan. Target repositori sudah di-clone di direktori kerja ini. ` +
     `Direktori target (absolut): ${workDir} — analisis HANYA repositori di direktori tersebut; ` +
     `abaikan repo/direktori lain di luar ${workDir} meskipun tampak lebih relevan. ` +
+    diffScopePart +
     `Jalankan skill '${skill}' dengan kedalaman analisis '${depth}' terhadap repo ini. ` +
     extra +
     `Selesaikan langkah-langkah di SKILL.md skill tersebut (baca via tool skill_view jika tersedia, ` +
@@ -346,8 +356,8 @@ function runHermes({ prompt, skill, workDir, label, timeoutMs }) {
 /**
  * @returns {Promise<{status: 'done'|'failed', output: string}>}
  */
-function runSkill(skill, workDir, depth, instructions, targetUrl) {
-  const taskPrompt = buildTaskPrompt(skill, depth, workDir, instructions, targetUrl);
+function runSkill(skill, workDir, depth, instructions, targetUrl, diffScope) {
+  const taskPrompt = buildTaskPrompt(skill, depth, workDir, instructions, targetUrl, diffScope);
   return runHermes({ prompt: taskPrompt, skill, workDir, label: skill });
 }
 
@@ -720,6 +730,37 @@ function getEligibleFixFindings(jobId) {
   return rows;
 }
 
+/* ------------------------------------------------------------------ */
+/* Diff-scope (review pre-merge vs base ref)                            */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Siapkan artefak diff-scope di workdir: fetch base ref lalu tulis
+ * secscan-diff.patch + secscan-changed.txt untuk dipakai prompt skill.
+ * @returns {{base: string, changedCount: number, diffBytes: number}|null}
+ */
+function prepareDiffScope(workDir, base) {
+  try {
+    execFileSync('git', ['-C', workDir, 'fetch', '--depth', '1', 'origin', base, '--no-tags'], { stdio: 'pipe', timeout: 120_000 });
+    // resolve base ke SHA aman (hindari injeksi ref melalui nama branch aneh)
+    const sha = execFileSync('git', ['-C', workDir, 'rev-parse', 'FETCH_HEAD'], { encoding: 'utf8', timeout: 30_000 }).trim();
+    if (!/^[0-9a-f]{7,40}$/.test(sha)) throw new Error('sha tidak valid');
+    // diff tiga-titik: kondisi workdir vs base
+    execFileSync('git', ['-C', workDir, 'add', '-A', '-N'], { stdio: 'ignore', timeout: 30_000 });
+    const diff = execFileSync('git', ['-C', workDir, 'diff', 'FETCH_HEAD'], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: 120_000 });
+    const norm = diff.replace(/\n*$/, '\n');
+    fs.writeFileSync(path.join(workDir, 'secscan-diff.patch'), norm, 'utf8');
+    const changed = execFileSync('git', ['-C', workDir, 'diff', '--name-only', 'FETCH_HEAD'], { encoding: 'utf8', timeout: 30_000 });
+    const files = changed.split('\n').map((s) => s.trim()).filter(Boolean);
+    fs.writeFileSync(path.join(workDir, 'secscan-changed.txt'), files.join('\n') + (files.length ? '\n' : ''), 'utf8');
+    console.log(`[worker] diff-scope siap: base ${base} (${sha.slice(0, 8)}), ${files.length} file berubah, diff ${norm.length} byte`);
+    return { base, changedCount: files.length, diffBytes: norm.length };
+  } catch (err) {
+    console.error('[worker] prepareDiffScope gagal:', err?.message ?? err);
+    return null;
+  }
+}
+
 /** Simpan temuan hasil parse ke job_findings + update severity_counts job. */
 function persistFindings(jobId, skill, parsed) {
   if (!parsed.length) return;
@@ -938,6 +979,18 @@ async function processJob(bullJob) {
   const skillResults = [];
   const allFindings = [];
 
+  // ——— Persiapan diff-scope (bila job.mode diff-scope) ———
+  let diffScope = null;
+  if (job.target_type === 'github' && job.diff_base && String(job.diff_base).trim()) {
+    diffScope = prepareDiffScope(workDir, String(job.diff_base).trim());
+    if (!diffScope) {
+      updateJob(jobId, { status: 'failed', error: `diff_base_fetch_failed: ${job.diff_base}` });
+      addAudit('job_error', jobId);
+      console.log(`[worker] job ${jobId} — fetch/resolve diff base gagal — failed`);
+      return;
+    }
+  }
+
   for (let i = 0; i < total; i++) {
     const skill = skills[i];
     console.log(`[worker] job ${jobId} — skill ${i + 1}/${total}: ${skill} (running)`);
@@ -946,7 +999,7 @@ async function processJob(bullJob) {
 
     let result;
     try {
-      result = await runSkill(skill, workDir, job.depth, job.instructions, targetUrl);
+      result = await runSkill(skill, workDir, job.depth, job.instructions, targetUrl, diffScope);
     } catch (err) {
       result = { status: 'failed', output: `internal_error: ${err.message}` };
     }

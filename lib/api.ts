@@ -35,6 +35,7 @@ export interface Job {
   share_token: string | null;
   validate: number;
   auto_fix: number;
+  diff_base: string | null;
   status: JobStatus;
   progress: number;
   current_skill: string | null;
@@ -99,6 +100,8 @@ export interface CreateJobBody {
   validate?: boolean;
   /** true → jalankan tahap 3 auto-fix (hanya target repo GitHub). */
   autoFix?: boolean;
+  /** Base ref (branch/SHA/tag) — bila diisi, job jadi diff-scope review pre-merge. */
+  diffBase?: string;
   confirmOfensif: boolean;
 }
 

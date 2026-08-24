@@ -51,7 +51,9 @@ export default function NewScanPage() {
   const [instructions, setInstructions] = useState('');
   const [validate, setValidate] = useState(false);
   const [autoFix, setAutoFix] = useState(false);
+  const [diffBase, setDiffBase] = useState('');
   const isUrlMode = targetMode === 'url';
+  const diffScopeActive = !isUrlMode && diffBase.trim().length > 0;
   const repoValid = isUrlMode ? repoUrl.trim().startsWith('http') : isValidGitHubUrl(repoUrl);
 
   // Step 2
@@ -117,6 +119,7 @@ export default function NewScanPage() {
         targetType: targetMode,
         validate,
         autoFix: !isUrlMode && autoFix,
+        diffBase: diffScopeActive ? diffBase.trim() : undefined,
         confirmOfensif: confirmed,
       });
       router.push(`/jobs/${jobId}`);
@@ -130,6 +133,9 @@ export default function NewScanPage() {
         switch (err.message) {
           case 'invalid_repo_url':
             message = 'URL repository tidak valid.';
+            break;
+          case 'invalid_diff_base':
+            message = 'Base ref diff-scope tidak valid (branch/SHA/tag, tanpa karakter aneh).';
             break;
           case 'invalid_target_url':
             message = `URL target tidak valid${err.detail ? ` (${err.detail})` : ''} — harus domain publik http/https.`;
@@ -316,6 +322,26 @@ export default function NewScanPage() {
                       className="rounded-lg border border-zinc-800 bg-zinc-950 px-3.5 py-2.5 font-mono text-sm text-zinc-100 placeholder-zinc-600 transition focus:border-emerald-500/60 focus:outline-none focus:ring-2 focus:ring-emerald-500/20"
                     />
                   </label>
+                )}
+
+                {!isUrlMode && (
+                  <div className="flex flex-col gap-1.5">
+                    <label htmlFor="diff-base" className="text-xs font-medium uppercase tracking-wide text-zinc-500">
+                      Base Diff-Scope{' '}
+                      <span className="normal-case text-zinc-600">(opsional)</span>
+                    </label>
+                    <input
+                      id="diff-base"
+                      type="text"
+                      value={diffBase}
+                      onChange={(e) => setDiffBase(e.target.value)}
+                      placeholder="mis. main — review hanya perubahan vs branch ini"
+                      className="rounded-lg border border-zinc-800 bg-zinc-950 px-3.5 py-2.5 font-mono text-sm text-zinc-100 placeholder-zinc-600 transition focus:border-emerald-500/60 focus:outline-none focus:ring-2 focus:ring-emerald-500/20"
+                    />
+                    <span className="text-[11px] leading-relaxed text-zinc-600">
+                      Diisi → mode review pre-merge: scan cepat hanya pada file yang berubah vs base.
+                    </span>
+                  </div>
                 )}
 
                 <fieldset className="flex flex-col gap-2">
@@ -541,6 +567,14 @@ export default function NewScanPage() {
                       {!isUrlMode && autoFix ? 'Aktif' : 'Tidak'}
                     </span>
                   </div>
+                  {!isUrlMode && (
+                    <div className="flex items-start justify-between gap-4">
+                      <span className="text-xs uppercase tracking-wide text-zinc-500">Diff-Scope</span>
+                      <span className={`text-sm font-medium ${diffScopeActive ? 'text-emerald-400' : 'text-zinc-500'}`}>
+                        {diffScopeActive ? `vs ${diffBase.trim()}` : 'Full scan'}
+                      </span>
+                    </div>
+                  )}
                   {instructions.trim() && (
                     <div className="flex flex-col gap-1">
                       <span className="text-xs uppercase tracking-wide text-zinc-500">Instruksi</span>
