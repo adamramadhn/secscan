@@ -28,6 +28,9 @@ export interface Job {
   target_type: string;
   skills: string[];
   depth: string;
+  instructions: string | null;
+  severity_counts: string | null;
+  share_token: string | null;
   status: JobStatus;
   progress: number;
   current_skill: string | null;
@@ -46,9 +49,24 @@ export interface JobSkill {
   output: string | null;
 }
 
+export type Severity = 'Critical' | 'High' | 'Medium' | 'Low' | 'Info';
+
+export interface Finding {
+  id: number;
+  job_id: string;
+  skill: string;
+  severity: Severity | string;
+  title: string;
+  description: string | null;
+  location: string | null;
+  recommendation: string | null;
+  created_at: number;
+}
+
 export interface JobDetail {
   job: Job;
   jobSkills: JobSkill[];
+  findings: Finding[];
 }
 
 export interface CreateJobBody {
@@ -56,6 +74,7 @@ export interface CreateJobBody {
   branch: string;
   skills: string[];
   depth: string;
+  instructions?: string | null;
   confirmOfensif: boolean;
 }
 

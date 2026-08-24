@@ -10,6 +10,9 @@ export interface JobRow {
   target_type: string;
   skills_json: string;
   depth: string;
+  instructions: string | null;
+  severity_counts: string | null;
+  share_token: string | null;
   status: string;
   progress: number;
   current_skill: string | null;
@@ -40,12 +43,28 @@ export interface AuditRow {
   detail: string;
 }
 
+export interface FindingRow {
+  id: number;
+  job_id: string;
+  skill: string;
+  severity: string; // Critical|High|Medium|Low|Info
+  title: string;
+  description: string | null;
+  location: string | null;
+  recommendation: string | null;
+  created_at: number;
+}
+
+export const SEVERITY_ORDER = ['Critical', 'High', 'Medium', 'Low', 'Info'] as const;
+export type Severity = (typeof SEVERITY_ORDER)[number];
+
 export interface CreateJobInput {
   repo_url: string;
   branch: string;
   target_type: string;
   skills_json: string;
   depth?: string;
+  instructions?: string | null;
 }
 
 export type JobPatch = Partial<
@@ -53,7 +72,8 @@ export type JobPatch = Partial<
 >;
 
 const JOB_COLUMNS = new Set([
-  'repo_url', 'branch', 'target_type', 'skills_json', 'depth',
+  'repo_url', 'branch', 'target_type', 'skills_json', 'depth', 'instructions',
+  'severity_counts', 'share_token',
   'status', 'progress', 'current_skill', 'report_path', 'error',
 ]);
 
@@ -118,6 +138,40 @@ export function initDb(): void {
       detail TEXT
     );
   `);
+  // Migrasi kolom/ tabel baru (aman dijalankan berulang — cek dulu).
+  migrate(db);
+}
+
+/** Migrasi ringan: tambah kolom jobs + tabel job_findings bila belum ada. */
+function migrate(db: Database.Database): void {
+  const jobCols = new Set(
+    (db.prepare('PRAGMA table_info(jobs)').all() as { name: string }[]).map((c) => c.name),
+  );
+  const colDefs: Record<string, string> = {
+    instructions: "TEXT",
+    severity_counts: "TEXT",
+    share_token: "TEXT",
+  };
+  for (const [col, def] of Object.entries(colDefs)) {
+    if (!jobCols.has(col)) {
+      db.prepare(`ALTER TABLE jobs ADD COLUMN ${col} ${def}`).run();
+    }
+  }
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS job_findings (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      job_id TEXT NOT NULL,
+      skill TEXT NOT NULL,
+      severity TEXT NOT NULL DEFAULT 'Info',
+      title TEXT NOT NULL,
+      description TEXT,
+      location TEXT,
+      recommendation TEXT,
+      created_at INTEGER NOT NULL,
+      FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_job_findings_job ON job_findings(job_id);
+  `);
 }
 
 export function createJob(input: CreateJobInput): JobRow {
@@ -125,9 +179,9 @@ export function createJob(input: CreateJobInput): JobRow {
   const now = Date.now();
   const id = uuidv4();
   db.prepare(
-    `INSERT INTO jobs (id, repo_url, branch, target_type, skills_json, depth, status, progress, created_at, updated_at)
-     VALUES (@id, @repo_url, @branch, @target_type, @skills_json, @depth, 'queued', 0, @now, @now)`
-  ).run({ id, ...input, depth: input.depth ?? 'medium', now });
+    `INSERT INTO jobs (id, repo_url, branch, target_type, skills_json, depth, instructions, status, progress, created_at, updated_at)
+     VALUES (@id, @repo_url, @branch, @target_type, @skills_json, @depth, @instructions, 'queued', 0, @now, @now)`
+  ).run({ id, ...input, depth: input.depth ?? 'medium', instructions: input.instructions ?? null, now });
   return getJob(id)!;
 }
 
@@ -172,6 +226,63 @@ export function upsertJobSkill(jobId: string, skill: string, patch: JobSkillPatc
 
 export function getJobSkills(jobId: string): JobSkillRow[] {
   return getDb().prepare('SELECT * FROM job_skills WHERE job_id = ? ORDER BY rowid').all(jobId) as JobSkillRow[];
+}
+
+export function getJobByShareToken(token: string): JobRow | null {
+  if (typeof token !== 'string' || token.length === 0 || token.length > 128) return null;
+  const row = getDb().prepare('SELECT * FROM jobs WHERE share_token = ?').get(token) as JobRow | undefined;
+  return row ?? null;
+}
+
+export interface NewFinding {
+  skill: string;
+  severity: string;
+  title: string;
+  description?: string | null;
+  location?: string | null;
+  recommendation?: string | null;
+}
+
+export function insertFindings(jobId: string, findings: NewFinding[]): void {
+  if (findings.length === 0) return;
+  const db = getDb();
+  const stmt = db.prepare(
+    `INSERT INTO job_findings (job_id, skill, severity, title, description, location, recommendation, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+  );
+  const now = Date.now();
+  const tx = db.transaction((rows: NewFinding[]) => {
+    for (const f of rows) {
+      stmt.run(
+        jobId,
+        f.skill,
+        f.severity,
+        f.title,
+        f.description ?? null,
+        f.location ?? null,
+        f.recommendation ?? null,
+        now,
+      );
+    }
+  });
+  tx(findings);
+}
+
+export function getJobFindings(jobId: string): FindingRow[] {
+  return getDb()
+    .prepare(
+      `SELECT * FROM job_findings WHERE job_id = ?
+       ORDER BY CASE severity
+         WHEN 'Critical' THEN 0 WHEN 'High' THEN 1 WHEN 'Medium' THEN 2
+         WHEN 'Low' THEN 3 ELSE 4 END, id`
+    )
+    .all(jobId) as FindingRow[];
+}
+
+export function severityCounts(findings: { severity: string }[]): string {
+  const counts: Record<string, number> = {};
+  for (const f of findings) counts[f.severity] = (counts[f.severity] ?? 0) + 1;
+  return JSON.stringify(counts);
 }
 
 export function addAudit(action: string, detail: string): void {

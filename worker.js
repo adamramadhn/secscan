@@ -26,6 +26,7 @@
 const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 
 const { Worker } = require('bullmq');
 const IORedis = require('ioredis');
@@ -119,12 +120,40 @@ db.exec(`
   );
 `);
 
+/* ------------------------------------------------------------------ */
+/* Migrasi (mirror lib/db.ts migrate())                                */
+/* ------------------------------------------------------------------ */
+
+function migrate() {
+  const cols = db.prepare('PRAGMA table_info(jobs)').all().map((c) => c.name);
+  if (!cols.includes('instructions')) db.prepare("ALTER TABLE jobs ADD COLUMN instructions TEXT").run();
+  if (!cols.includes('severity_counts')) db.prepare("ALTER TABLE jobs ADD COLUMN severity_counts TEXT").run();
+  if (!cols.includes('share_token')) db.prepare("ALTER TABLE jobs ADD COLUMN share_token TEXT").run();
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS job_findings (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      job_id TEXT NOT NULL,
+      skill TEXT NOT NULL,
+      severity TEXT NOT NULL DEFAULT 'Info',
+      title TEXT NOT NULL,
+      description TEXT,
+      location TEXT,
+      recommendation TEXT,
+      created_at INTEGER NOT NULL,
+      FOREIGN KEY (job_id) REFERENCES jobs(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_job_findings_job ON job_findings(job_id);
+  `);
+}
+migrate();
+
 function getJob(id) {
   return db.prepare('SELECT * FROM jobs WHERE id = ?').get(id) ?? null;
 }
 
 function updateJob(id, patch) {
   const allowed = new Set(['repo_url', 'branch', 'target_type', 'skills_json', 'depth',
+    'instructions', 'severity_counts', 'share_token',
     'status', 'progress', 'current_skill', 'report_path', 'error']);
   const entries = Object.entries(patch).filter(([k, v]) => allowed.has(k) && v !== undefined);
   if (entries.length === 0) return getJob(id);
@@ -175,16 +204,23 @@ function truncateOutput(raw) {
 /* runSkill: spawn `hermes -z <TASK> -s <skill> --in <workDir> --safe-mode` */
 /* ------------------------------------------------------------------ */
 
-function buildTaskPrompt(skill, depth, workDir) {
+function buildTaskPrompt(skill, depth, workDir, instructions) {
+  const extra = instructions && instructions.trim()
+    ? `Instruksi khusus dari operator (WAJIB diikuti): ${instructions.trim()} `
+    : '';
   return (
     `Kamu adalah auditor keamanan. Target repositori sudah di-clone di direktori kerja ini. ` +
     `Direktori target (absolut): ${workDir} — analisis HANYA repositori di direktori tersebut; ` +
     `abaikan repo/direktori lain di luar ${workDir} meskipun tampak lebih relevan. ` +
     `Jalankan skill '${skill}' dengan kedalaman analisis '${depth}' terhadap repo ini. ` +
+    extra +
     `Selesaikan langkah-langkah di SKILL.md skill tersebut (baca via tool skill_view jika tersedia, ` +
     `atau ikuti prosedur standar). Hasil akhir WAJIB berupa laporan markdown dengan struktur: ` +
     `## Ringkasan, ## Temuan (setiap temuan: severity [Critical/High/Medium/Low/Info], deskripsi, ` +
     `lokasi file jika relevan, rekomendasi perbaikan), ## Rekomendasi Prioritas. ` +
+    `Format setiap temuan WAJIB konsisten agar bisa diparse otomatis: ` +
+    `- **[Severity]** Judul singkat — deskripsi. Baris berikutnya: \`Lokasi: <file:baris>\` dan \`Rekomendasi: <perbaikan>\`. ` +
+    `Jika tidak ada temuan, tulis "Tidak ada temuan." di bawah ## Temuan. ` +
     `Jangan memodifikasi file repo. Jangan menjalankan perintah destruktif. ` +
     `Fokus analisis statis/analitis. Akhiri jawaban dengan laporan markdown lengkap.`
   );
@@ -193,9 +229,9 @@ function buildTaskPrompt(skill, depth, workDir) {
 /**
  * @returns {Promise<{status: 'done'|'failed', output: string}>}
  */
-function runSkill(skill, workDir, depth) {
+function runSkill(skill, workDir, depth, instructions) {
   return new Promise((resolve) => {
-    const taskPrompt = buildTaskPrompt(skill, depth, workDir);
+    const taskPrompt = buildTaskPrompt(skill, depth, workDir, instructions);
     const args = ['-z', taskPrompt, '-s', skill, '--in', workDir, '--safe-mode'];
     const env = { ...process.env, PATH: `${HERMES_PATH}:${process.env.PATH ?? ''}` };
 
@@ -268,11 +304,185 @@ function runSkill(skill, workDir, depth) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Parser findings (port CommonJS dari lib/findings.ts — jaga sinkron) */
+/* ------------------------------------------------------------------ */
+
+const SEVERITIES = ['Critical', 'High', 'Medium', 'Low', 'Info'];
+const MAX_FINDINGS = 200;
+
+function normalizeSeverity(raw) {
+  const s = String(raw).trim().toLowerCase();
+  for (const sev of SEVERITIES) {
+    if (sev.toLowerCase() === s) return sev;
+  }
+  return null;
+}
+
+function clean(text) {
+  return String(text)
+    .replace(/\*\*/g, '')
+    .replace(/\[(Critical|High|Medium|Low|Info)\]\s*/gi, '')
+    .replace(/`/g, '')
+    .trim();
+}
+
+function clip(text, max) {
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+}
+
+function extractFindingsSection(markdown) {
+  if (typeof markdown !== 'string' || markdown.length === 0) return '';
+  const sectionRe = /^#{2,3}[ \t]*(Temuan|Findings)[ \t]*:?[ \t]*$/im;
+  const m = markdown.match(sectionRe);
+  if (!m || m.index === undefined) return '';
+  const rest = markdown.slice(m.index + m[0].length);
+  const next = rest.match(/^#{1,3}[ \t]+(?!\d+[.)])[^\n]*$/m);
+  return next && next.index !== undefined ? rest.slice(0, next.index) : rest;
+}
+
+function parseFindings(output) {
+  if (!output) return [];
+  const section = extractFindingsSection(output);
+  if (!section) return [];
+
+  const findings = [];
+  const lines = section.split(/\r?\n/);
+
+  const itemRe = /^\s*(?:[-*+]|\d+[.)])[ \t]+/;
+  const headingItemRe = /^\s*#{3,6}[ \t]+\d+[.)][ \t]+/;
+  const bareBracketRe = /^\s*(?:\*\*)?\[(Critical|High|Medium|Low|Info)\](?:\*\*)?[ \t]+/i;
+  const locRe = /^\s*(?:\*\*)?(lokasi|location|file|berkas)(?:\*\*)?[ \t]*[:：][ \t]*(.+)$/i;
+  const recRe = /^\s*(?:\*\*)?(rekomendasi|recommendation|perbaikan|remediasi|fix|solusi)(?:\*\*)?[ \t]*[:：][ \t]*(.+)$/i;
+  const severityBracket = /\[(Critical|High|Medium|Low|Info)\]/i;
+  const severityLabel = /^\s*(?:\*\*)?(?:severity|severitas|tingkat)(?:\*\*)?[ \t]*[:：][ \t]*(Critical|High|Medium|Low|Info)/i;
+  const severityParen = /[ \t]*\((?:severity|severitas|tingkat)[ \t]*[:：]?[ \t]*(Critical|High|Medium|Low|Info)\)[ \t]*$/i;
+
+  let current = null;
+
+  const pushCurrent = () => {
+    if (!current) return;
+    current.title = clip(clean(current.title), 300) || '(tanpa judul)';
+    if (current.description) current.description = clip(clean(current.description), 4000);
+    if (current.location) current.location = clip(clean(current.location), 500);
+    if (current.recommendation) current.recommendation = clip(clean(current.recommendation), 4000);
+    findings.push(current);
+  };
+
+  for (const line of lines) {
+    let body = null;
+    let prefixSeverity = null;
+    if (itemRe.test(line)) body = line.replace(itemRe, '');
+    else if (headingItemRe.test(line)) body = line.replace(headingItemRe, '');
+    else if (bareBracketRe.test(line)) {
+      prefixSeverity = normalizeSeverity(line.match(bareBracketRe)[1]);
+      body = line.replace(bareBracketRe, '');
+    }
+
+    if (body !== null) {
+      pushCurrent();
+      if (findings.length >= MAX_FINDINGS) break;
+
+      let severity = null;
+      const paren = body.match(severityParen);
+      if (paren) {
+        severity = normalizeSeverity(paren[1]);
+        body = body.replace(severityParen, '');
+      }
+      const bracket = body.match(severityBracket);
+      if (bracket) {
+        severity = normalizeSeverity(bracket[1]);
+        body = body.replace(severityBracket, '');
+      } else if (prefixSeverity) {
+        severity = prefixSeverity;
+      } else {
+        const label = body.match(severityLabel);
+        if (label) {
+          severity = normalizeSeverity(label[1]);
+          body = body.slice(label[0].length);
+        }
+      }
+
+      let title = body;
+      let description = null;
+      const sep = title.match(/\s+—\s+|\s+-\s+|\s*[:：]\s+/);
+      if (sep && sep.index !== undefined && sep.index > 0) {
+        description = title.slice(sep.index + sep[0].length).trim() || null;
+        title = title.slice(0, sep.index);
+      }
+      title = clean(title);
+      if (!title) {
+        current = null;
+        continue;
+      }
+      current = { severity: severity ?? 'Info', title, description, location: null, recommendation: null };
+      continue;
+    }
+
+    if (!current) continue;
+
+    const loc = line.match(locRe);
+    if (loc) {
+      current.location = current.location ? `${current.location} ${loc[2].trim()}` : loc[2].trim();
+      continue;
+    }
+    const rec = line.match(recRe);
+    if (rec) {
+      current.recommendation = current.recommendation ? `${current.recommendation} ${rec[2].trim()}` : rec[2].trim();
+      continue;
+    }
+
+    const text = line.trim();
+    if (text) {
+      const desc = clean(text);
+      current.description = current.description ? `${current.description} ${desc}` : desc;
+    }
+  }
+  pushCurrent();
+
+  return findings.slice(0, MAX_FINDINGS);
+}
+
+/** Hitung agregat severity dari kumpulan temuan. */
+function countSeverities(findings) {
+  const counts = {};
+  for (const sev of SEVERITIES) counts[sev] = 0;
+  for (const f of findings) {
+    counts[f.severity] = (counts[f.severity] ?? 0) + 1;
+  }
+  return counts;
+}
+
+/** Token share acak 32 hex char. */
+function randomToken() {
+  return crypto.randomBytes(16).toString('hex');
+}
+
+/** Simpan temuan hasil parse ke job_findings + update severity_counts job. */
+function persistFindings(jobId, skill, parsed) {
+  if (!parsed.length) return;
+  const stmt = db.prepare(
+    `INSERT INTO job_findings (job_id, skill, severity, title, description, location, recommendation, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+  );
+  const now = Date.now();
+  const tx = db.transaction((rows) => {
+    for (const f of rows) {
+      stmt.run(jobId, skill, f.severity, f.title, f.description ?? null, f.location ?? null, f.recommendation ?? null, now);
+    }
+  });
+  tx(parsed);
+  const all = db.prepare('SELECT severity FROM job_findings WHERE job_id = ?').all(jobId);
+  updateJob(jobId, { severity_counts: JSON.stringify(countSeverities(all.map((r) => r.severity))) });
+}
+
+/* ------------------------------------------------------------------ */
 /* Report                                                                 */
 /* ------------------------------------------------------------------ */
 
-function buildReport(job, skillResults, finalStatus) {
+function buildReport(job, skillResults, finalStatus, allFindings) {
   const lines = [];
+  const counts = countSeverities(allFindings);
+  const totalFindings = allFindings.length;
   lines.push('---');
   lines.push(`jobId: ${job.id}`);
   lines.push(`repo_url: ${job.repo_url}`);
@@ -280,9 +490,36 @@ function buildReport(job, skillResults, finalStatus) {
   lines.push(`depth: ${job.depth}`);
   lines.push(`tanggal: ${new Date().toISOString()}`);
   lines.push(`total_skills: ${skillResults.length}`);
+  lines.push(`total_temuan: ${totalFindings}`);
+  lines.push(`severity: Critical=${counts.Critical} High=${counts.High} Medium=${counts.Medium} Low=${counts.Low} Info=${counts.Info}`);
   lines.push(`status: ${finalStatus}`);
   lines.push('---');
   lines.push('');
+
+  // Ringkasan eksekutif — temuan terurut severity.
+  if (totalFindings > 0) {
+    lines.push('# Ringkasan Temuan');
+    lines.push('');
+    lines.push(`Total **${totalFindings}** temuan — **${counts.Critical}** Critical, **${counts.High}** High, **${counts.Medium}** Medium, **${counts.Low}** Low, **${counts.Info}** Info.`);
+    lines.push('');
+    lines.push('| # | Severity | Judul | Skill | Lokasi |');
+    lines.push('|---|---|---|---|---|');
+    const order = { Critical: 0, High: 1, Medium: 2, Low: 3, Info: 4 };
+    const sorted = [...allFindings].sort((a, b) => (order[a.severity] ?? 9) - (order[b.severity] ?? 9));
+    sorted.forEach((f, i) => {
+      const esc = (s) => String(s ?? '').replace(/\|/g, '\\|').replace(/\r?\n/g, ' ');
+      lines.push(`| ${i + 1} | **${f.severity}** | ${esc(f.title)} | ${esc(f.skill)} | ${esc(f.location) ?? '—'} |`);
+    });
+    lines.push('');
+  }
+
+  if (job.instructions && job.instructions.trim()) {
+    lines.push('# Instruksi Operator');
+    lines.push('');
+    lines.push(job.instructions.trim());
+    lines.push('');
+  }
+
   for (const r of skillResults) {
     lines.push(`## Skill: ${r.skill}`);
     lines.push('');
@@ -300,11 +537,11 @@ function buildReport(job, skillResults, finalStatus) {
   return lines.join('\n');
 }
 
-function writeReport(job, skillResults, finalStatus) {
+function writeReport(job, skillResults, finalStatus, allFindings) {
   const dir = path.join(REPORT_DIR, job.id);
   fs.mkdirSync(dir, { recursive: true });
   const reportPath = path.join(dir, 'report.md');
-  fs.writeFileSync(reportPath, buildReport(job, skillResults, finalStatus), 'utf8');
+  fs.writeFileSync(reportPath, buildReport(job, skillResults, finalStatus, allFindings), 'utf8');
   console.log(`[worker] report ditulis: ${reportPath}`);
   return reportPath;
 }
@@ -355,6 +592,7 @@ async function processJob(bullJob) {
 
   const total = skills.length;
   const skillResults = [];
+  const allFindings = [];
 
   for (let i = 0; i < total; i++) {
     const skill = skills[i];
@@ -364,7 +602,7 @@ async function processJob(bullJob) {
 
     let result;
     try {
-      result = await runSkill(skill, workDir, job.depth);
+      result = await runSkill(skill, workDir, job.depth, job.instructions);
     } catch (err) {
       result = { status: 'failed', output: `internal_error: ${err.message}` };
     }
@@ -374,6 +612,21 @@ async function processJob(bullJob) {
       finished_at: Date.now(),
       output: result.output,
     });
+
+    // Parse + persist temuan hanya dari skill yang sukses (output failed = noise).
+    if (result.status === 'done') {
+      try {
+        const parsed = parseFindings(result.output);
+        persistFindings(jobId, skill, parsed);
+        for (const f of parsed) allFindings.push({ ...f, skill });
+        if (parsed.length > 0) {
+          console.log(`[worker] job ${jobId} — ${parsed.length} temuan diparse dari ${skill}`);
+        }
+      } catch (err) {
+        console.error(`[worker] gagal parse/persist findings ${skill}:`, err?.message ?? err);
+      }
+    }
+
     console.log(`[worker] job ${jobId} — skill ${skill}: ${result.status} (${(result.output ?? '').length} bytes output)`);
 
     const progress = Math.round(((i + 1) / total) * 100);
@@ -384,14 +637,25 @@ async function processJob(bullJob) {
   const allDone = skillResults.every((r) => r.status === 'done');
   const failedSkills = skillResults.filter((r) => r.status === 'failed').map((r) => r.skill);
 
+  // Share token: generate saat job terminal dengan report (untuk link /r/<token>).
+  if (!job.share_token) {
+    try {
+      updateJob(jobId, { share_token: randomToken() });
+    } catch (err) {
+      console.error('[worker] gagal set share_token:', err?.message ?? err);
+    }
+  }
+
   if (allDone) {
-    const reportPath = writeReport(job, skillResults, 'done');
+    const freshJob = getJob(jobId);
+    const reportPath = writeReport(freshJob ?? job, skillResults, 'done', allFindings);
     updateJob(jobId, { status: 'done', progress: 100, report_path: reportPath, current_skill: null });
     addAudit('job_done', jobId);
     console.log(`[worker] job ${jobId} SELESAI (done), report: ${reportPath}`);
   } else {
     const errorSummary = `skills gagal: ${failedSkills.join(', ')}`;
-    const reportPath = writeReport(job, skillResults, 'failed');
+    const freshJob = getJob(jobId);
+    const reportPath = writeReport(freshJob ?? job, skillResults, 'failed', allFindings);
     updateJob(jobId, {
       status: 'failed',
       progress: 100,

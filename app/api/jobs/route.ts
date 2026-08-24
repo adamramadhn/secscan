@@ -17,6 +17,7 @@ interface JobBody {
   branch?: unknown;
   skills?: unknown;
   depth?: unknown;
+  instructions?: unknown;
   confirmOfensif?: unknown;
 }
 
@@ -55,6 +56,16 @@ export const POST = withAuth(async (req: Request) => {
 
   const branch = typeof body.branch === 'string' && body.branch.trim().length > 0 ? body.branch.trim() : 'main';
 
+  // Instruksi kustom operator (opsional, max 4000 char, satu baris).
+  let instructions: string | null = null;
+  if (typeof body.instructions === 'string') {
+    const cleaned = body.instructions.replace(/[\r\n\t]+/g, ' ').trim();
+    if (cleaned.length > 4000) {
+      return NextResponse.json({ error: 'instructions_too_long' }, { status: 400 });
+    }
+    instructions = cleaned.length > 0 ? cleaned : null;
+  }
+
   // Persist job dulu (status 'queued'), lalu clone source.
   const job = createJob({
     repo_url: repoUrl,
@@ -62,6 +73,7 @@ export const POST = withAuth(async (req: Request) => {
     target_type: 'github',
     skills_json: JSON.stringify(skills),
     depth,
+    instructions,
   });
 
   const workDir = process.env.WORK_DIR ?? '/var/lib/secscan/work';

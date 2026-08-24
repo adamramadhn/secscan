@@ -10,9 +10,11 @@ import {
   getJob,
   Job,
   JobSkill,
+  Finding,
 } from '@/lib/api';
 import StatusBadge from '@/components/StatusBadge';
 import Progress from '@/components/Progress';
+import FindingsPanel from '@/components/FindingsPanel';
 
 function relativeTime(ts: number): string {
   const diff = Math.max(0, Date.now() - ts);
@@ -38,14 +40,17 @@ export default function JobDetailPage() {
 
   const [job, setJob] = useState<Job | null>(null);
   const [jobSkills, setJobSkills] = useState<JobSkill[]>([]);
+  const [findings, setFindings] = useState<Finding[]>([]);
   const [notFound, setNotFound] = useState(false);
   const [loading, setLoading] = useState(true);
   const [live, setLive] = useState(false);
+  const [copied, setCopied] = useState(false);
 
-  // Sinkronkan state dari snapshot { job, jobSkills }.
-  const applySnapshot = useCallback((data: { job: Job; jobSkills: JobSkill[] }) => {
+  // Sinkronkan state dari snapshot { job, jobSkills, findings }.
+  const applySnapshot = useCallback((data: { job: Job; jobSkills: JobSkill[]; findings?: Finding[] }) => {
     setJob(data.job);
     setJobSkills(data.jobSkills);
+    setFindings(data.findings ?? []);
     setLoading(false);
     setNotFound(false);
   }, []);
@@ -127,8 +132,22 @@ export default function JobDetailPage() {
 
   const terminal = job?.status === 'done' || job?.status === 'failed';
   const canDownload = Boolean(job?.report_path) && terminal;
-  const hasFindings = jobSkills.some((js) => (js.output ?? '').includes('## Temuan'));
+  const criticalCount = findings.filter((f) => f.severity === 'Critical' || f.severity === 'High').length;
+  const hasFindings = criticalCount > 0 || jobSkills.some((js) => (js.output ?? '').includes('## Temuan'));
   const activeSkill = jobSkills.find((js) => js.status === 'running');
+
+  async function copyShareLink() {
+    if (!job?.share_token) return;
+    const url = `${window.location.origin}/api/share/${job.share_token}/report`;
+    try {
+      await navigator.clipboard.writeText(url);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch {
+      // clipboard API gagal (mis. non-secure context) — fallback prompt
+      window.prompt('Salin link report:', url);
+    }
+  }
 
   if (loading) {
     return (
@@ -176,6 +195,14 @@ export default function JobDetailPage() {
           >
             Download Report
           </a>
+          {job.share_token && terminal && (
+            <button
+              onClick={copyShareLink}
+              className="rounded-lg border border-zinc-800 px-3.5 py-2 text-sm text-zinc-300 transition hover:border-zinc-700 hover:text-zinc-100"
+            >
+              {copied ? '✓ Tersalin' : 'Share Link'}
+            </button>
+          )}
         </div>
       </header>
 
@@ -197,14 +224,19 @@ export default function JobDetailPage() {
                 <span>{relativeTime(job.created_at)}</span>
               </div>
             </div>
-            <div className="flex flex-wrap items-center gap-2">
-              {hasFindings && (
-                <span className="inline-flex items-center gap-1.5 rounded-full border border-amber-500/30 bg-amber-500/10 px-2.5 py-0.5 text-xs font-medium text-amber-400">
-                  Ada temuan
-                </span>
-              )}
-              <StatusBadge status={job.status} />
-            </div>
+          <div className="flex flex-wrap items-center gap-2">
+            {criticalCount > 0 && (
+              <span className="inline-flex items-center gap-1.5 rounded-full border border-red-500/30 bg-red-500/10 px-2.5 py-0.5 text-xs font-medium text-red-300">
+                {criticalCount} Critical/High
+              </span>
+            )}
+            {hasFindings && criticalCount === 0 && (
+              <span className="inline-flex items-center gap-1.5 rounded-full border border-amber-500/30 bg-amber-500/10 px-2.5 py-0.5 text-xs font-medium text-amber-400">
+                Ada temuan
+              </span>
+            )}
+            <StatusBadge status={job.status} />
+          </div>
           </div>
 
           <Progress value={job.progress} />
@@ -234,7 +266,17 @@ export default function JobDetailPage() {
               {job.error}
             </p>
           )}
+
+          {job.instructions && (
+            <div className="mt-4 rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2.5">
+              <p className="text-xs font-medium uppercase tracking-wide text-zinc-500">Instruksi operator</p>
+              <p className="mt-1 break-words text-sm leading-relaxed text-zinc-300">{job.instructions}</p>
+            </div>
+          )}
         </div>
+
+        {/* Temuan terstruktur (muncul live saat skill selesai) */}
+        <FindingsPanel findings={findings} />
 
         {/* Daftar skill */}
         <div className="flex flex-col gap-3">

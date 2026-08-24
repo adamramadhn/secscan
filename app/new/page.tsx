@@ -42,6 +42,7 @@ export default function NewScanPage() {
   const [repoUrl, setRepoUrl] = useState('');
   const [branch, setBranch] = useState('main');
   const [depth, setDepth] = useState('medium');
+  const [instructions, setInstructions] = useState('');
   const repoValid = isValidGitHubUrl(repoUrl);
 
   // Step 2
@@ -87,6 +88,7 @@ export default function NewScanPage() {
         branch: branch.trim() || 'main',
         skills: Array.from(selected),
         depth,
+        instructions: instructions.trim() || null,
         confirmOfensif: hasOfensif ? confirmed : false,
       });
       router.push(`/jobs/${jobId}`);
@@ -109,6 +111,9 @@ export default function NewScanPage() {
             break;
           case 'too_many_jobs':
             message = 'Terlalu banyak scan aktif. Tunggu sampai ada yang selesai, lalu coba lagi.';
+            break;
+          case 'instructions_too_long':
+            message = 'Instruksi terlalu panjang (maks 4000 karakter).';
             break;
           case 'clone_failed':
             message = err.detail
@@ -274,6 +279,23 @@ export default function NewScanPage() {
                     })}
                   </div>
                 </fieldset>
+
+                <label className="flex flex-col gap-1.5">
+                  <span className="text-xs font-medium uppercase tracking-wide text-zinc-500">
+                    Instruksi Khusus{' '}
+                    <span className="normal-case text-zinc-600">(opsional)</span>
+                  </span>
+                  <textarea
+                    value={instructions}
+                    onChange={(e) => setInstructions(e.target.value.slice(0, 4000))}
+                    rows={3}
+                    placeholder="Contoh: fokus pada business logic flaw dan IDOR; abaikan folder docs/; sertakan contoh PoC tiap temuan."
+                    className="resize-y rounded-lg border border-zinc-800 bg-zinc-950 px-3.5 py-2.5 text-sm leading-relaxed text-zinc-100 placeholder-zinc-600 transition focus:border-emerald-500/60 focus:outline-none focus:ring-2 focus:ring-emerald-500/20"
+                  />
+                  <span className="text-right text-[11px] text-zinc-600">
+                    {instructions.length}/4000 — diteruskan ke setiap skill
+                  </span>
+                </label>
               </div>
             )}
 
@@ -363,6 +385,14 @@ export default function NewScanPage() {
                     <span className="text-xs uppercase tracking-wide text-zinc-500">Skill</span>
                     <span className="text-right text-sm text-zinc-200">{selected.size} skill</span>
                   </div>
+                  {instructions.trim() && (
+                    <div className="flex flex-col gap-1">
+                      <span className="text-xs uppercase tracking-wide text-zinc-500">Instruksi</span>
+                      <p className="rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-2 text-sm leading-relaxed text-zinc-300">
+                        {instructions.trim()}
+                      </p>
+                    </div>
+                  )}
                 </div>
 
                 <div className="flex flex-wrap gap-2">

@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import { withAuth } from '@/lib/require-auth';
-import { getJob, getJobSkills } from '@/lib/db';
+import { getJob, getJobSkills, getJobFindings } from '@/lib/db';
 
 export const GET = withAuth(async (_req: Request, ctx) => {
   const { id } = await ctx!.params;
@@ -16,5 +16,9 @@ export const GET = withAuth(async (_req: Request, ctx) => {
     skillsParsed = [];
   }
 
-  return NextResponse.json({ job: { ...job, skills: skillsParsed }, jobSkills: getJobSkills(id) });
+  return NextResponse.json({
+    job: { ...job, skills: skillsParsed },
+    jobSkills: getJobSkills(id),
+    findings: getJobFindings(id),
+  });
 });
