@@ -735,26 +735,67 @@ function getEligibleFixFindings(jobId) {
 /* ------------------------------------------------------------------ */
 
 /**
- * Siapkan artefak diff-scope di workdir: fetch base ref lalu tulis
+ * Siapkan artefak diff-scope di workdir: resolve base ref → SHA, tulis
  * secscan-diff.patch + secscan-changed.txt untuk dipakai prompt skill.
- * @returns {{base: string, changedCount: number, diffBytes: number}|null}
+ * Urutan resolve: fetch ref langsung (branch/tag/SHA penuh) → GitHub API
+ * (repo publik, SHA singkat) → unshallow lokal + rev-parse (repo private).
+ * @returns {{base: string, sha: string, changedCount: number, diffBytes: number}|null}
  */
-function prepareDiffScope(workDir, base) {
+async function prepareDiffScope(workDir, base, repoUrl) {
+  const git = (args, opts = {}) =>
+    execFileSync('git', ['-C', workDir, ...args], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: 120_000, ...opts });
   try {
-    execFileSync('git', ['-C', workDir, 'fetch', '--depth', '1', 'origin', base, '--no-tags'], { stdio: 'pipe', timeout: 120_000 });
-    // resolve base ke SHA aman (hindari injeksi ref melalui nama branch aneh)
-    const sha = execFileSync('git', ['-C', workDir, 'rev-parse', 'FETCH_HEAD'], { encoding: 'utf8', timeout: 30_000 }).trim();
-    if (!/^[0-9a-f]{7,40}$/.test(sha)) throw new Error('sha tidak valid');
-    // diff tiga-titik: kondisi workdir vs base
-    execFileSync('git', ['-C', workDir, 'add', '-A', '-N'], { stdio: 'ignore', timeout: 30_000 });
-    const diff = execFileSync('git', ['-C', workDir, 'diff', 'FETCH_HEAD'], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, timeout: 120_000 });
+    let sha = null;
+    // 1) fetch ref langsung — bekerja untuk branch/tag/SHA penuh.
+    try {
+      git(['fetch', '--depth', '1', 'origin', base, '--no-tags'], { stdio: 'pipe' });
+      sha = git(['rev-parse', 'FETCH_HEAD']).trim();
+    } catch {
+      // 2) SHA singkat → resolve via GitHub API (hanya repo publik).
+      if (/^[0-9a-f]{7,39}$/i.test(base)) {
+        let apiRef = null;
+        try {
+          const res = await fetch(`https://api.github.com/repos/${repoUrl.replace('https://github.com/', '')}/commits/${base}`, {
+            headers: { 'User-Agent': 'secscan-worker', Accept: 'application/vnd.github+json' },
+            signal: AbortSignal.timeout(15_000),
+          });
+          if (res.ok) {
+            const data = await res.json();
+            if (data?.sha && /^[0-9a-f]{40}$/.test(data.sha)) apiRef = data.sha;
+          }
+        } catch { /* lanjut fallback lokal */ }
+        if (apiRef) {
+          try {
+            git(['fetch', '--depth', '1', 'origin', apiRef, '--no-tags'], { stdio: 'pipe' });
+            sha = git(['rev-parse', 'FETCH_HEAD']).trim();
+          } catch { /* lanjut fallback lokal */ }
+        }
+        // 3) Fallback lokal (repo private): unshallow lalu rev-parse SHA singkat.
+        if (!sha) {
+          try {
+            git(['fetch', '--unshallow', 'origin', '--no-tags'], { stdio: 'pipe', timeout: 180_000 });
+          } catch { /* mungkin sudah lengkap */ }
+          try {
+            sha = git(['rev-parse', '--verify', `${base}^{commit}`]).trim();
+          } catch {
+            throw new Error(`base ref '${base}' tidak ditemukan (lokal maupun remote)`);
+          }
+        }
+      } else {
+        throw new Error(`base ref '${base}' tidak bisa di-fetch`);
+      }
+    }
+    if (!sha || !/^[0-9a-f]{7,40}$/.test(sha)) throw new Error('sha tidak valid');
+    // diff workdir (kondisi branch HEAD) vs SHA base.
+    git(['add', '-A', '-N'], { stdio: 'ignore' });
+    const diff = git(['diff', sha]);
     const norm = diff.replace(/\n*$/, '\n');
     fs.writeFileSync(path.join(workDir, 'secscan-diff.patch'), norm, 'utf8');
-    const changed = execFileSync('git', ['-C', workDir, 'diff', '--name-only', 'FETCH_HEAD'], { encoding: 'utf8', timeout: 30_000 });
+    const changed = git(['diff', '--name-only', sha]);
     const files = changed.split('\n').map((s) => s.trim()).filter(Boolean);
     fs.writeFileSync(path.join(workDir, 'secscan-changed.txt'), files.join('\n') + (files.length ? '\n' : ''), 'utf8');
     console.log(`[worker] diff-scope siap: base ${base} (${sha.slice(0, 8)}), ${files.length} file berubah, diff ${norm.length} byte`);
-    return { base, changedCount: files.length, diffBytes: norm.length };
+    return { base, sha, changedCount: files.length, diffBytes: norm.length };
   } catch (err) {
     console.error('[worker] prepareDiffScope gagal:', err?.message ?? err);
     return null;
@@ -982,7 +1023,7 @@ async function processJob(bullJob) {
   // ——— Persiapan diff-scope (bila job.mode diff-scope) ———
   let diffScope = null;
   if (job.target_type === 'github' && job.diff_base && String(job.diff_base).trim()) {
-    diffScope = prepareDiffScope(workDir, String(job.diff_base).trim());
+    diffScope = await prepareDiffScope(workDir, String(job.diff_base).trim(), job.repo_url);
     if (!diffScope) {
       updateJob(jobId, { status: 'failed', error: `diff_base_fetch_failed: ${job.diff_base}` });
       addAudit('job_error', jobId);
