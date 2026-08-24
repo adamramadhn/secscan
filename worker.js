@@ -675,7 +675,9 @@ function captureGitDiff(workDir) {
   try {
     execFileSync('git', ['-C', workDir, 'add', '-A', '-N'], { stdio: 'ignore', timeout: 30_000 });
     const diff = execFileSync('git', ['-C', workDir, 'diff'], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, timeout: 60_000 });
-    return diff.trim();
+    // Normalisasi trailing newline: git apply butuh baris terakhir diakhiri \n,
+    // tapi jangan biarkan multiple blank lines menempel di akhir.
+    return diff.replace(/\n*$/, '\n');
   } catch (err) {
     console.error('[worker] captureGitDiff gagal:', err?.message ?? err);
     return null;
