@@ -204,10 +204,35 @@ function truncateOutput(raw) {
 /* runSkill: spawn `hermes -z <TASK> -s <skill> --in <workDir> --safe-mode` */
 /* ------------------------------------------------------------------ */
 
-function buildTaskPrompt(skill, depth, workDir, instructions) {
+function buildTaskPrompt(skill, depth, workDir, instructions, targetUrl) {
   const extra = instructions && instructions.trim()
     ? `Instruksi khusus dari operator (WAJIB diikuti): ${instructions.trim()} `
     : '';
+  const findingFormat =
+    `Format setiap temuan WAJIB konsisten agar bisa diparse otomatis: ` +
+    `- **[Severity]** Judul singkat — deskripsi. Baris berikutnya: \`Lokasi: <file:baris atau URL>\` dan \`Rekomendasi: <perbaikan>\`. ` +
+    `Jika tidak ada temuan, tulis "Tidak ada temuan." di bawah ## Temuan. `;
+
+  if (targetUrl) {
+    // Target live (black-box): worker mengirim permintaan jaringan ke URL ini.
+    return (
+      `Kamu adalah auditor keamanan yang diberi izin eksplisit oleh operator untuk menguji target live berikut. ` +
+      `Target URL (satu-satunya yang boleh diuji): ${targetUrl} ` +
+      `Jangan menguji host/domain/IP lain di luar ${targetUrl}. ` +
+      `Jalankan skill '${skill}' dengan kedalaman analisis '${depth}' terhadap aplikasi live tersebut. ` +
+      extra +
+      `Selesaikan langkah-langkah di SKILL.md skill tersebut (baca via tool skill_view jika tersedia, ` +
+      `atau ikuti prosedur standar). Gunakan tool web yang tersedia untuk memeriksa target ` +
+      `(response header, robots, endpoint umum, form) secara non-destruktif — tidak ada payload perusak, ` +
+      `tidak ada brute-force besar-besaran, hormati rate limit target. ` +
+      `Hasil akhir WAJIB berupa laporan markdown dengan struktur: ` +
+      `## Ringkasan, ## Temuan (setiap temuan: severity [Critical/High/Medium/Low/Info], deskripsi, ` +
+      `lokasi (URL/endpoint) jika relevan, rekomendasi perbaikan), ## Rekomendasi Prioritas. ` +
+      findingFormat +
+      `Akhiri jawaban dengan laporan markdown lengkap.`
+    );
+  }
+
   return (
     `Kamu adalah auditor keamanan. Target repositori sudah di-clone di direktori kerja ini. ` +
     `Direktori target (absolut): ${workDir} — analisis HANYA repositori di direktori tersebut; ` +
@@ -218,9 +243,7 @@ function buildTaskPrompt(skill, depth, workDir, instructions) {
     `atau ikuti prosedur standar). Hasil akhir WAJIB berupa laporan markdown dengan struktur: ` +
     `## Ringkasan, ## Temuan (setiap temuan: severity [Critical/High/Medium/Low/Info], deskripsi, ` +
     `lokasi file jika relevan, rekomendasi perbaikan), ## Rekomendasi Prioritas. ` +
-    `Format setiap temuan WAJIB konsisten agar bisa diparse otomatis: ` +
-    `- **[Severity]** Judul singkat — deskripsi. Baris berikutnya: \`Lokasi: <file:baris>\` dan \`Rekomendasi: <perbaikan>\`. ` +
-    `Jika tidak ada temuan, tulis "Tidak ada temuan." di bawah ## Temuan. ` +
+    findingFormat +
     `Jangan memodifikasi file repo. Jangan menjalankan perintah destruktif. ` +
     `Fokus analisis statis/analitis. Akhiri jawaban dengan laporan markdown lengkap.`
   );
@@ -229,9 +252,9 @@ function buildTaskPrompt(skill, depth, workDir, instructions) {
 /**
  * @returns {Promise<{status: 'done'|'failed', output: string}>}
  */
-function runSkill(skill, workDir, depth, instructions) {
+function runSkill(skill, workDir, depth, instructions, targetUrl) {
   return new Promise((resolve) => {
-    const taskPrompt = buildTaskPrompt(skill, depth, workDir, instructions);
+    const taskPrompt = buildTaskPrompt(skill, depth, workDir, instructions, targetUrl);
     const args = ['-z', taskPrompt, '-s', skill, '--in', workDir, '--safe-mode'];
     const env = { ...process.env, PATH: `${HERMES_PATH}:${process.env.PATH ?? ''}` };
 
@@ -582,8 +605,9 @@ async function processJob(bullJob) {
     return;
   }
 
-  console.log(`[worker] mulai job ${jobId}: ${skills.length} skill (${skills.join(', ')}) depth=${job.depth}`);
+  console.log(`[worker] mulai job ${jobId}: ${skills.length} skill (${skills.join(', ')}) depth=${job.depth} target=${job.target_type}`);
   const workDir = path.join(WORK_DIR, jobId);
+  const targetUrl = job.target_type === 'url' ? job.repo_url : null;
   if (!fs.existsSync(workDir)) {
     updateJob(jobId, { status: 'failed', error: 'workdir_missing' });
     addAudit('job_error', jobId);
@@ -603,7 +627,7 @@ async function processJob(bullJob) {
 
     let result;
     try {
-      result = await runSkill(skill, workDir, job.depth, job.instructions);
+      result = await runSkill(skill, workDir, job.depth, job.instructions, targetUrl);
     } catch (err) {
       result = { status: 'failed', output: `internal_error: ${err.message}` };
     }
@@ -674,12 +698,13 @@ async function processJob(bullJob) {
 /* ------------------------------------------------------------------ */
 
 const connection = new IORedis(REDIS_URL, { maxRetriesPerRequest: null });
+const WORKER_CONCURRENCY = Math.max(1, Math.min(Number(process.env.WORKER_CONCURRENCY ?? 2), 5));
 const worker = new Worker(QUEUE_NAME, processJob, {
   connection,
-  concurrency: 1,
+  concurrency: WORKER_CONCURRENCY,
 });
 
-worker.on('ready', () => console.log(`[worker] ready — listening queue '${QUEUE_NAME}' (redis ${REDIS_URL})`));
+worker.on('ready', () => console.log(`[worker] ready — queue '${QUEUE_NAME}' concurrency=${WORKER_CONCURRENCY} (redis ${REDIS_URL})`));
 worker.on('completed', (j) => console.log(`[worker] bullmq completed: ${j.id}`));
 worker.on('failed', (j, err) => {
   const jobId = j?.data?.jobId;

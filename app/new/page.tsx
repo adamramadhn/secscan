@@ -13,6 +13,11 @@ const DEPTHS: { value: string; label: string; desc: string }[] = [
   { value: 'deep', label: 'Deep', desc: 'Menyeluruh — butuh waktu lebih lama' },
 ];
 
+const TARGET_MODES = [
+  { value: 'github', label: 'Repo GitHub', desc: 'Analisis source code repo publik' },
+  { value: 'url', label: 'URL Live', desc: 'Uji aplikasi yang sedang berjalan (black-box) — butuh konfirmasi izin' },
+] as const;
+
 const GROUP_META: Record<string, { title: string; tint: string }> = {
   ofensif: {
     title: 'Ofensif — butuh konfirmasi',
@@ -39,11 +44,13 @@ export default function NewScanPage() {
   const [submitting, setSubmitting] = useState(false);
 
   // Step 1
+  const [targetMode, setTargetMode] = useState<'github' | 'url'>('github');
   const [repoUrl, setRepoUrl] = useState('');
   const [branch, setBranch] = useState('main');
   const [depth, setDepth] = useState('medium');
   const [instructions, setInstructions] = useState('');
-  const repoValid = isValidGitHubUrl(repoUrl);
+  const isUrlMode = targetMode === 'url';
+  const repoValid = isUrlMode ? repoUrl.trim().startsWith('http') : isValidGitHubUrl(repoUrl);
 
   // Step 2
   const [skills, setSkills] = useState<SkillDef[]>([]);
@@ -75,6 +82,22 @@ export default function NewScanPage() {
     setConfirmed(false); // pilihan berubah → konfirmasi harus diulang
   }
 
+  function switchTargetMode(mode: 'github' | 'url') {
+    setTargetMode(mode);
+    // Skill repo-only (SAST dsb.) tidak berlaku untuk URL live → bersihkan.
+    if (mode === 'url') {
+      setSelected((prev) => {
+        const next = new Set(prev);
+        for (const name of next) {
+          if (skills.find((s) => s.name === name)?.requiresRepo) next.delete(name);
+        }
+        return next;
+      });
+      setBranch('main');
+    }
+    setConfirmed(false);
+  }
+
   const selectedSkills = skills.filter((s) => selected.has(s.name));
   const hasOfensif = selectedSkills.some((s) => s.ofensif);
 
@@ -89,7 +112,8 @@ export default function NewScanPage() {
         skills: Array.from(selected),
         depth,
         instructions: instructions.trim() || null,
-        confirmOfensif: hasOfensif ? confirmed : false,
+        targetType: targetMode,
+        confirmOfensif: confirmed,
       });
       router.push(`/jobs/${jobId}`);
     } catch (err) {
@@ -102,6 +126,12 @@ export default function NewScanPage() {
         switch (err.message) {
           case 'invalid_repo_url':
             message = 'URL repository tidak valid.';
+            break;
+          case 'invalid_target_url':
+            message = `URL target tidak valid${err.detail ? ` (${err.detail})` : ''} — harus domain publik http/https.`;
+            break;
+          case 'skill_requires_repo':
+            message = `Skill "${err.unknown ?? ''}" hanya untuk target repo GitHub.`;
             break;
           case 'invalid_skills':
             message = 'Daftar skill tidak valid.';
@@ -203,42 +233,86 @@ export default function NewScanPage() {
             {step === 0 && (
               <div className="flex flex-col gap-6">
                 <div className="flex flex-col gap-1.5">
-                  <h2 className="text-lg font-semibold text-zinc-100">Target Repository</h2>
+                  <h2 className="text-lg font-semibold text-zinc-100">Target Scan</h2>
                   <p className="text-sm text-zinc-500">
-                    Repository GitHub publik yang akan di-scan.
+                    Pilih jenis target yang akan dianalisis.
                   </p>
                 </div>
 
+                <fieldset className="flex flex-col gap-2">
+                  <span className="text-xs font-medium uppercase tracking-wide text-zinc-500">
+                    Jenis Target
+                  </span>
+                  <div className="grid gap-2 sm:grid-cols-2">
+                    {TARGET_MODES.map((m) => {
+                      const activeMode = targetMode === m.value;
+                      return (
+                        <label
+                          key={m.value}
+                          className={`cursor-pointer rounded-lg border p-3.5 transition ${
+                            activeMode
+                              ? 'border-emerald-500/50 bg-emerald-500/10'
+                              : 'border-zinc-800 bg-zinc-950 hover:border-zinc-700'
+                          }`}
+                        >
+                          <input
+                            type="radio"
+                            name="targetMode"
+                            value={m.value}
+                            checked={activeMode}
+                            onChange={() => switchTargetMode(m.value)}
+                            className="sr-only"
+                          />
+                          <span
+                            className={`block text-sm font-semibold ${
+                              activeMode ? 'text-emerald-400' : 'text-zinc-200'
+                            }`}
+                          >
+                            {m.label}
+                          </span>
+                          <span className="mt-1 block text-xs leading-relaxed text-zinc-500">
+                            {m.desc}
+                          </span>
+                        </label>
+                      );
+                    })}
+                  </div>
+                </fieldset>
+
                 <label className="flex flex-col gap-1.5">
                   <span className="text-xs font-medium uppercase tracking-wide text-zinc-500">
-                    Repo URL
+                    {isUrlMode ? 'Target URL' : 'Repo URL'}
                   </span>
                   <input
                     type="text"
                     value={repoUrl}
                     onChange={(e) => setRepoUrl(e.target.value)}
-                    placeholder="https://github.com/owner/repo"
+                    placeholder={isUrlMode ? 'https://app.contoh.com' : 'https://github.com/owner/repo'}
                     className="rounded-lg border border-zinc-800 bg-zinc-950 px-3.5 py-2.5 font-mono text-sm text-zinc-100 placeholder-zinc-600 transition focus:border-emerald-500/60 focus:outline-none focus:ring-2 focus:ring-emerald-500/20"
                   />
                   {repoUrl.trim().length > 0 && !repoValid && (
                     <span className="text-xs text-red-400">
-                      Format harus https://github.com/owner/repo
+                      {isUrlMode
+                        ? 'Masukkan URL http/https lengkap (domain publik)'
+                        : 'Format harus https://github.com/owner/repo'}
                     </span>
                   )}
                 </label>
 
-                <label className="flex flex-col gap-1.5">
-                  <span className="text-xs font-medium uppercase tracking-wide text-zinc-500">
-                    Branch
-                  </span>
-                  <input
-                    type="text"
-                    value={branch}
-                    onChange={(e) => setBranch(e.target.value)}
-                    placeholder="main"
-                    className="rounded-lg border border-zinc-800 bg-zinc-950 px-3.5 py-2.5 font-mono text-sm text-zinc-100 placeholder-zinc-600 transition focus:border-emerald-500/60 focus:outline-none focus:ring-2 focus:ring-emerald-500/20"
-                  />
-                </label>
+                {!isUrlMode && (
+                  <label className="flex flex-col gap-1.5">
+                    <span className="text-xs font-medium uppercase tracking-wide text-zinc-500">
+                      Branch
+                    </span>
+                    <input
+                      type="text"
+                      value={branch}
+                      onChange={(e) => setBranch(e.target.value)}
+                      placeholder="main"
+                      className="rounded-lg border border-zinc-800 bg-zinc-950 px-3.5 py-2.5 font-mono text-sm text-zinc-100 placeholder-zinc-600 transition focus:border-emerald-500/60 focus:outline-none focus:ring-2 focus:ring-emerald-500/20"
+                    />
+                  </label>
+                )}
 
                 <fieldset className="flex flex-col gap-2">
                   <span className="text-xs font-medium uppercase tracking-wide text-zinc-500">
@@ -322,18 +396,22 @@ export default function NewScanPage() {
                           .filter((s): s is SkillDef => Boolean(s))
                           .map((skill) => {
                             const checked = selected.has(skill.name);
+                            const disabled = isUrlMode && skill.requiresRepo;
                             return (
                               <label
                                 key={skill.name}
-                                className={`flex cursor-pointer items-start gap-3 rounded-lg border p-3.5 transition ${
-                                  checked
-                                    ? 'border-emerald-500/50 bg-emerald-500/10'
-                                    : 'border-zinc-800 bg-zinc-950 hover:border-zinc-700'
+                                className={`flex items-start gap-3 rounded-lg border p-3.5 transition ${
+                                  disabled
+                                    ? 'cursor-not-allowed border-zinc-800/60 bg-zinc-950/60 opacity-45'
+                                    : checked
+                                      ? 'cursor-pointer border-emerald-500/50 bg-emerald-500/10'
+                                      : 'cursor-pointer border-zinc-800 bg-zinc-950 hover:border-zinc-700'
                                 }`}
                               >
                                 <input
                                   type="checkbox"
                                   checked={checked}
+                                  disabled={disabled}
                                   onChange={() => toggleSkill(skill.name)}
                                   className="mt-0.5 h-4 w-4 rounded border-zinc-700 bg-zinc-900 accent-emerald-500"
                                 />
@@ -347,7 +425,7 @@ export default function NewScanPage() {
                                     )}
                                   </span>
                                   <span className="text-xs leading-relaxed text-zinc-500">
-                                    {skill.description}
+                                    {disabled ? `${skill.description} (khusus repo)` : skill.description}
                                   </span>
                                 </span>
                               </label>
@@ -368,15 +446,25 @@ export default function NewScanPage() {
 
                 <div className="flex flex-col gap-4 rounded-lg border border-zinc-800 bg-zinc-950 p-5">
                   <div className="flex items-start justify-between gap-4">
-                    <span className="text-xs uppercase tracking-wide text-zinc-500">Repository</span>
+                    <span className="text-xs uppercase tracking-wide text-zinc-500">Jenis Target</span>
+                    <span className="text-sm text-zinc-200">
+                      {isUrlMode ? 'URL Live (black-box)' : 'Repo GitHub'}
+                    </span>
+                  </div>
+                  <div className="flex items-start justify-between gap-4">
+                    <span className="text-xs uppercase tracking-wide text-zinc-500">
+                      {isUrlMode ? 'Target URL' : 'Repository'}
+                    </span>
                     <span className="break-all text-right font-mono text-sm text-zinc-200">
                       {repoUrl.trim()}
                     </span>
                   </div>
-                  <div className="flex items-start justify-between gap-4">
-                    <span className="text-xs uppercase tracking-wide text-zinc-500">Branch</span>
-                    <span className="font-mono text-sm text-zinc-200">{branch.trim() || 'main'}</span>
-                  </div>
+                  {!isUrlMode && (
+                    <div className="flex items-start justify-between gap-4">
+                      <span className="text-xs uppercase tracking-wide text-zinc-500">Branch</span>
+                      <span className="font-mono text-sm text-zinc-200">{branch.trim() || 'main'}</span>
+                    </div>
+                  )}
                   <div className="flex items-start justify-between gap-4">
                     <span className="text-xs uppercase tracking-wide text-zinc-500">Kedalaman</span>
                     <span className="text-sm capitalize text-zinc-200">{depth}</span>
@@ -411,7 +499,31 @@ export default function NewScanPage() {
                   ))}
                 </div>
 
-                {hasOfensif && (
+                {isUrlMode && (
+                  <div className="rounded-lg border border-red-500/30 bg-red-500/10 p-4">
+                    <p className="text-sm font-semibold text-red-300">
+                      🌐 Scan ini menguji aplikasi live
+                    </p>
+                    <p className="mt-1 text-sm leading-relaxed text-red-300/80">
+                      Worker akan mengirim permintaan jaringan nyata ke URL target. Pastikan Anda
+                      memiliki hak dan izin tertulis untuk menguji aplikasi tersebut — konfirmasi
+                      wajib untuk semua skill pada target live.
+                    </p>
+                    <label className="mt-3 flex cursor-pointer items-start gap-2.5">
+                      <input
+                        type="checkbox"
+                        checked={confirmed}
+                        onChange={(e) => setConfirmed(e.target.checked)}
+                        className="mt-0.5 h-4 w-4 rounded border-zinc-700 bg-zinc-900 accent-emerald-500"
+                      />
+                      <span className="text-sm text-zinc-200">
+                        Saya mengonfirmasi target ini milik saya / saya punya izin untuk mengujinya
+                      </span>
+                    </label>
+                  </div>
+                )}
+
+                {hasOfensif && !isUrlMode && (
                   <div className="rounded-lg border border-red-500/30 bg-red-500/10 p-4">
                     <p className="text-sm font-semibold text-red-300">
                       ⚠️ Scan ini mencakup skill ofensif
@@ -465,7 +577,7 @@ export default function NewScanPage() {
             ) : (
               <button
                 onClick={handleSubmit}
-                disabled={submitting || (hasOfensif && !confirmed)}
+                disabled={submitting || ((isUrlMode || hasOfensif) && !confirmed)}
                 className="rounded-lg bg-emerald-500 px-5 py-2 text-sm font-semibold text-zinc-950 transition hover:bg-emerald-400 disabled:cursor-not-allowed disabled:opacity-50"
               >
                 {submitting ? 'Menjalankan…' : 'Jalankan Scan'}

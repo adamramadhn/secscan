@@ -10,6 +10,8 @@ export interface SkillDef {
   category: 'ofensif' | 'scanning' | 'analisis';
   description: string;
   ofensif: boolean;
+  /** true = hanya untuk target repo (tidak berlaku utk URL live). */
+  requiresRepo: boolean;
 }
 
 export interface Groups {
@@ -75,6 +77,8 @@ export interface CreateJobBody {
   skills: string[];
   depth: string;
   instructions?: string | null;
+  /** 'github' (default) | 'url' — target URL live black-box. */
+  targetType?: 'github' | 'url';
   confirmOfensif: boolean;
 }
 
