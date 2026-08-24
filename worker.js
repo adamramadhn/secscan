@@ -442,12 +442,13 @@ function parseFindings(output) {
   return findings.slice(0, MAX_FINDINGS);
 }
 
-/** Hitung agregat severity dari kumpulan temuan. */
-function countSeverities(findings) {
+/** Hitung agregat severity dari kumpulan { severity } (atau string severity). */
+function countSeverities(items) {
   const counts = {};
   for (const sev of SEVERITIES) counts[sev] = 0;
-  for (const f of findings) {
-    counts[f.severity] = (counts[f.severity] ?? 0) + 1;
+  for (const item of items) {
+    const sev = typeof item === 'string' ? item : item.severity;
+    counts[sev] = (counts[sev] ?? 0) + 1;
   }
   return counts;
 }
