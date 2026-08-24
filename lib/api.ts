@@ -33,6 +33,7 @@ export interface Job {
   instructions: string | null;
   severity_counts: string | null;
   share_token: string | null;
+  validate: number;
   status: JobStatus;
   progress: number;
   current_skill: string | null;
@@ -53,6 +54,8 @@ export interface JobSkill {
 
 export type Severity = 'Critical' | 'High' | 'Medium' | 'Low' | 'Info';
 
+export type ValidationStatus = 'confirmed' | 'refuted' | 'inconclusive';
+
 export interface Finding {
   id: number;
   job_id: string;
@@ -62,6 +65,8 @@ export interface Finding {
   description: string | null;
   location: string | null;
   recommendation: string | null;
+  validation_status: ValidationStatus | null;
+  validation_evidence: string | null;
   created_at: number;
 }
 
@@ -79,6 +84,8 @@ export interface CreateJobBody {
   instructions?: string | null;
   /** 'github' (default) | 'url' — target URL live black-box. */
   targetType?: 'github' | 'url';
+  /** true → jalankan tahap 2 validasi temuan (PoC-lite). */
+  validate?: boolean;
   confirmOfensif: boolean;
 }
 

@@ -49,6 +49,7 @@ export default function NewScanPage() {
   const [branch, setBranch] = useState('main');
   const [depth, setDepth] = useState('medium');
   const [instructions, setInstructions] = useState('');
+  const [validate, setValidate] = useState(false);
   const isUrlMode = targetMode === 'url';
   const repoValid = isUrlMode ? repoUrl.trim().startsWith('http') : isValidGitHubUrl(repoUrl);
 
@@ -113,6 +114,7 @@ export default function NewScanPage() {
         depth,
         instructions: instructions.trim() || null,
         targetType: targetMode,
+        validate,
         confirmOfensif: confirmed,
       });
       router.push(`/jobs/${jobId}`);
@@ -370,6 +372,31 @@ export default function NewScanPage() {
                     {instructions.length}/4000 — diteruskan ke setiap skill
                   </span>
                 </label>
+
+                <label
+                  className={`flex cursor-pointer items-start gap-3 rounded-lg border p-3.5 transition ${
+                    validate
+                      ? 'border-emerald-500/50 bg-emerald-500/10'
+                      : 'border-zinc-800 bg-zinc-950 hover:border-zinc-700'
+                  }`}
+                >
+                  <input
+                    type="checkbox"
+                    checked={validate}
+                    onChange={(e) => setValidate(e.target.checked)}
+                    className="mt-0.5 h-4 w-4 rounded border-zinc-700 bg-zinc-900 accent-emerald-500"
+                  />
+                  <span className="flex flex-col gap-1">
+                    <span className={`text-sm font-semibold ${validate ? 'text-emerald-400' : 'text-zinc-200'}`}>
+                      Validasi Temuan (PoC-lite)
+                    </span>
+                    <span className="text-xs leading-relaxed text-zinc-500">
+                      Setelah semua skill selesai, temuan non-Info diuji ulang satu per satu oleh
+                      validator untuk memastikan nyata (confirmed) atau false positive (refuted) —
+                      beserta bukti. Menambah waktu eksekusi job.
+                    </span>
+                  </span>
+                </label>
               </div>
             )}
 
@@ -472,6 +499,12 @@ export default function NewScanPage() {
                   <div className="flex items-start justify-between gap-4">
                     <span className="text-xs uppercase tracking-wide text-zinc-500">Skill</span>
                     <span className="text-right text-sm text-zinc-200">{selected.size} skill</span>
+                  </div>
+                  <div className="flex items-start justify-between gap-4">
+                    <span className="text-xs uppercase tracking-wide text-zinc-500">Validasi PoC</span>
+                    <span className={`text-sm font-medium ${validate ? 'text-emerald-400' : 'text-zinc-500'}`}>
+                      {validate ? 'Aktif' : 'Tidak'}
+                    </span>
                   </div>
                   {instructions.trim() && (
                     <div className="flex flex-col gap-1">

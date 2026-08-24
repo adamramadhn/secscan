@@ -129,6 +129,7 @@ function migrate() {
   if (!cols.includes('instructions')) db.prepare("ALTER TABLE jobs ADD COLUMN instructions TEXT").run();
   if (!cols.includes('severity_counts')) db.prepare("ALTER TABLE jobs ADD COLUMN severity_counts TEXT").run();
   if (!cols.includes('share_token')) db.prepare("ALTER TABLE jobs ADD COLUMN share_token TEXT").run();
+  if (!cols.includes('validate')) db.prepare("ALTER TABLE jobs ADD COLUMN validate INTEGER DEFAULT 0").run();
   db.exec(`
     CREATE TABLE IF NOT EXISTS job_findings (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -144,6 +145,9 @@ function migrate() {
     );
     CREATE INDEX IF NOT EXISTS idx_job_findings_job ON job_findings(job_id);
   `);
+  const fCols = db.prepare('PRAGMA table_info(job_findings)').all().map((c) => c.name);
+  if (!fCols.includes('validation_status')) db.exec(`ALTER TABLE job_findings ADD COLUMN validation_status TEXT`);
+  if (!fCols.includes('validation_evidence')) db.exec(`ALTER TABLE job_findings ADD COLUMN validation_evidence TEXT`);
 }
 migrate();
 
@@ -153,7 +157,7 @@ function getJob(id) {
 
 function updateJob(id, patch) {
   const allowed = new Set(['repo_url', 'branch', 'target_type', 'skills_json', 'depth',
-    'instructions', 'severity_counts', 'share_token',
+    'instructions', 'severity_counts', 'share_token', 'validate',
     'status', 'progress', 'current_skill', 'report_path', 'error']);
   const entries = Object.entries(patch).filter(([k, v]) => allowed.has(k) && v !== undefined);
   if (entries.length === 0) return getJob(id);
@@ -481,6 +485,162 @@ function randomToken() {
   return crypto.randomBytes(16).toString('hex');
 }
 
+/* ------------------------------------------------------------------ */
+/* Tahap 2: validasi temuan (PoC-lite)                                  */
+/* ------------------------------------------------------------------ */
+
+const VAL_STATUSES = ['confirmed', 'refuted', 'inconclusive'];
+const MAX_VALIDATED = 25;
+
+function normalizeValStatus(raw) {
+  const aliases = {
+    confirmed: 'confirmed', confirm: 'confirmed', valid: 'confirmed', validated: 'confirmed',
+    terkonfirmasi: 'confirmed', benar: 'confirmed',
+    refuted: 'refuted', refute: 'refuted', invalid: 'refuted', false_positive: 'refuted',
+    salah: 'refuted', ditolak: 'refuted',
+    inconclusive: 'inconclusive', undetermined: 'inconclusive', unknown: 'inconclusive', ragu: 'inconclusive',
+  };
+  if (typeof raw !== 'string') return 'inconclusive';
+  return aliases[raw.trim().toLowerCase()] ?? 'inconclusive';
+}
+
+/** Ambil blok ```json terakhir yang berupa array {id,status,evidence}. */
+function parseValidationOutput(output) {
+  if (!output) return [];
+  const blocks = [...String(output).matchAll(/```json\s*([\s\S]*?)```/g)];
+  for (let i = blocks.length - 1; i >= 0; i--) {
+    let parsed;
+    try {
+      parsed = JSON.parse(blocks[i][1]);
+    } catch {
+      continue;
+    }
+    if (!Array.isArray(parsed)) continue;
+    const items = parsed
+      .filter((x) => x && typeof x === 'object' && Number.isInteger(x.id))
+      .map((x) => ({
+        id: x.id,
+        status: normalizeValStatus(x.status),
+        evidence: typeof x.evidence === 'string' ? x.evidence.slice(0, 2000) : null,
+      }));
+    if (items.length > 0) return items;
+  }
+  return [];
+}
+
+/** Prompt validator: uji ulang tiap temuan dengan bukti konkret. */
+function buildValidatorPrompt(findings, workDir, targetUrl) {
+  const list = findings
+    .map((f) =>
+      `- id=${f.id} [${f.severity}] ${f.title}\n  deskripsi: ${(f.description ?? '').slice(0, 500)}\n  lokasi: ${f.location ?? '—'}`
+    )
+    .join('\n');
+  const targetDesc = targetUrl
+    ? `Target live (satu-satunya yang boleh diuji, izin operator ada): ${targetUrl}. Gunakan permintaan non-destruktif ke sana untuk membuktikan/menolak tiap temuan (mis. cek header respons, endpoint, perilaku). Jangan menyentuh host lain.`
+    : `Repositori target sudah di-clone di ${workDir} — baca file yang dirujuk untuk membuktikan/menolak tiap temuan.`;
+  return (
+    `Kamu adalah validator temuan keamanan senior (tahap verifikasi PoC-lite). ` +
+    `Di bawah ini daftar temuan dari audit tahap pertama yang harus kamu UJI ULANG SATU PER SATU dengan bukti konkret. ` +
+    `${targetDesc} ` +
+    `Untuk tiap temuan, tentukan status:\n` +
+    `- "confirmed": temuan TERBUKTI nyata — sertakan bukti spesifik (potongan file:baris yang dicek, atau perilaku/parameter respons aktual).\n` +
+    `- "refuted": temuan TERBUKTI keliru/false positive — jelaskan kenapa (mis. file tidak ada, mitigasi sudah ada di tempat lain).\n` +
+    `- "inconclusive": tidak bisa dibuktikan tanpa runtime/data tambahan — sebutkan apa yang kurang.\n` +
+    `DAFTAR TEMUAN:\n${list}\n\n` +
+    `WAJIB akhiri jawaban dengan blok json (dan hanya itu blok json terakhir) berisi array — satu objek per temuan:\n` +
+    '```json\n[{"id": <id temuan>, "status": "confirmed|refuted|inconclusive", "evidence": "<bukti ringkas maks 2-3 kalimat>"}]\n```\n' +
+    `Jangan memodifikasi file repo. Non-destruktif saja.`
+  );
+}
+
+/**
+ * Jalankan hermes validator untuk daftar temuan.
+ * @returns {Promise<{status:'done'|'failed', output: string}>}
+ */
+function runValidator(findings, workDir, targetUrl) {
+  const taskPrompt = buildValidatorPrompt(findings, workDir, targetUrl);
+  const args = ['-z', taskPrompt, '--in', workDir, '--safe-mode'];
+  const env = { ...process.env, PATH: `${HERMES_PATH}:${process.env.PATH ?? ''}` };
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn(HERMES_BIN, args, { cwd: workDir, env, stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch (err) {
+      resolve({ status: 'failed', output: `spawn_error: ${err.message}` });
+      return;
+    }
+    let stdout = Buffer.alloc(0);
+    let stderr = Buffer.alloc(0);
+    let settled = false;
+    let killedByTimeout = false;
+    let killTimer = null;
+    const finish = (status, output) => {
+      if (settled) return;
+      settled = true;
+      if (killTimer) clearTimeout(killTimer);
+      resolve({ status, output: truncateOutput(output) });
+    };
+    child.stdout.on('data', (c) => {
+      stdout = Buffer.concat([stdout, c]);
+      if (stdout.length > OUTPUT_LIMIT * 4) stdout = stdout.subarray(stdout.length - OUTPUT_LIMIT * 4);
+    });
+    child.stderr.on('data', (c) => {
+      stderr = Buffer.concat([stderr, c]);
+      if (stderr.length > OUTPUT_LIMIT * 4) stderr = stderr.subarray(stderr.length - OUTPUT_LIMIT * 4);
+    });
+    const timeoutId = setTimeout(() => {
+      if (settled) return;
+      killedByTimeout = true;
+      try { child.kill('SIGTERM'); } catch { /* ignore */ }
+      killTimer = setTimeout(() => {
+        try { child.kill('SIGKILL'); } catch { /* ignore */ }
+      }, KILL_GRACE_MS);
+    }, RUN_TIMEOUT_MS);
+    child.on('error', (err) => finish('failed', `[spawn error] ${err.message}`));
+    child.on('close', (code, signal) => {
+      clearTimeout(timeoutId);
+      const combined = Buffer.concat([stdout, Buffer.from('\n'), stderr]).toString('utf8');
+      if (killedByTimeout) {
+        finish('failed', `TIMEOUT setelah ${RUN_TIMEOUT_MS / 60000} menit.\n${combined}`);
+        return;
+      }
+      if (code === 0) finish('done', combined);
+      else {
+        const why = signal ? ` killed by signal ${signal}` : '';
+        finish('failed', `exit code ${code}${why}\n${combined}`);
+      }
+    });
+  });
+}
+
+/** Ambil temuan job yang layak divalidasi (non-Info, max 25, urut severity). */
+function getEligibleFindings(jobId) {
+  const rows = db
+    .prepare(
+      `SELECT id, severity, title, description, location FROM job_findings
+       WHERE job_id = ? AND severity != 'Info'
+       ORDER BY CASE severity
+         WHEN 'Critical' THEN 0 WHEN 'High' THEN 1 WHEN 'Medium' THEN 2
+         WHEN 'Low' THEN 3 ELSE 4 END, id
+       LIMIT ${MAX_VALIDATED}`
+    )
+    .all(jobId);
+  return rows;
+}
+
+/** Terapkan hasil validasi ke job_findings. */
+function applyValidation(jobId, items) {
+  const stmt = db.prepare(
+    'UPDATE job_findings SET validation_status = ?, validation_evidence = ? WHERE id = ? AND job_id = ?'
+  );
+  const tx = db.transaction((rows) => {
+    for (const it of rows) {
+      stmt.run(it.status, it.evidence ?? null, it.id, jobId);
+    }
+  });
+  tx(items);
+}
+
 /** Simpan temuan hasil parse ke job_findings + update severity_counts job. */
 function persistFindings(jobId, skill, parsed) {
   if (!parsed.length) return;
@@ -503,7 +663,7 @@ function persistFindings(jobId, skill, parsed) {
 /* Report                                                                 */
 /* ------------------------------------------------------------------ */
 
-function buildReport(job, skillResults, finalStatus, allFindings) {
+function buildReport(job, skillResults, finalStatus, allFindings, validationInfo) {
   const lines = [];
   const counts = countSeverities(allFindings);
   const totalFindings = allFindings.length;
@@ -520,21 +680,49 @@ function buildReport(job, skillResults, finalStatus, allFindings) {
   lines.push('---');
   lines.push('');
 
-  // Ringkasan eksekutif — temuan terurut severity.
+  // Ringkasan eksekutif — temuan terurut severity, dengan status validasi.
   if (totalFindings > 0) {
     lines.push('# Ringkasan Temuan');
     lines.push('');
     lines.push(`Total **${totalFindings}** temuan — **${counts.Critical}** Critical, **${counts.High}** High, **${counts.Medium}** Medium, **${counts.Low}** Low, **${counts.Info}** Info.`);
     lines.push('');
-    lines.push('| # | Severity | Judul | Skill | Lokasi |');
-    lines.push('|---|---|---|---|---|');
+    lines.push('| # | Severity | Judul | Skill | Lokasi | Validasi |');
+    lines.push('|---|---|---|---|---|---|');
     const order = { Critical: 0, High: 1, Medium: 2, Low: 3, Info: 4 };
     const sorted = [...allFindings].sort((a, b) => (order[a.severity] ?? 9) - (order[b.severity] ?? 9));
+    const valMap = new Map((validationInfo?.validatedRows ?? []).map((r) => [r.id, r]));
     sorted.forEach((f, i) => {
       const esc = (s) => String(s ?? '').replace(/\|/g, '\\|').replace(/\r?\n/g, ' ');
-      lines.push(`| ${i + 1} | **${f.severity}** | ${esc(f.title)} | ${esc(f.skill)} | ${esc(f.location) ?? '—'} |`);
+      const val = validationInfo?.validatedRows ? (valMap.get(f.id)?.status ?? '—') : '';
+      lines.push(`| ${i + 1} | **${f.severity}** | ${esc(f.title)} | ${esc(f.skill)} | ${esc(f.location) ?? '—'} | ${val} |`);
     });
     lines.push('');
+  }
+
+  // Ringkasan validasi (tahap PoC) bila dijalankan.
+  if (validationInfo) {
+    lines.push('# Validasi Temuan (PoC-lite)');
+    lines.push('');
+    if (validationInfo.status === 'done') {
+      lines.push(`**${validationInfo.validated}** temuan diverifikasi: **${validationInfo.confirmed}** confirmed, **${validationInfo.refuted}** refuted, sisanya inconclusive.`);
+      lines.push('');
+      const valRows = validationInfo.validatedRows ?? [];
+      if (valRows.length > 0) {
+        lines.push('| ID | Status | Bukti |');
+        lines.push('|---|---|---|');
+        const esc = (s) => String(s ?? '').replace(/\|/g, '\\|').replace(/\r?\n/g, ' ');
+        for (const r of valRows) {
+          lines.push(`| ${r.id} | **${r.status}** | ${esc(r.evidence).slice(0, 300)} |`);
+        }
+        lines.push('');
+      }
+    } else if (validationInfo.status === 'skipped') {
+      lines.push('Dilewati — tidak ada temuan non-Info yang layak divalidasi.');
+      lines.push('');
+    } else {
+      lines.push(`Gagal: ${validationInfo.reason ?? 'unknown'}. Temuan tetap dilaporkan tanpa status validasi.`);
+      lines.push('');
+    }
   }
 
   if (job.instructions && job.instructions.trim()) {
@@ -561,11 +749,23 @@ function buildReport(job, skillResults, finalStatus, allFindings) {
   return lines.join('\n');
 }
 
-function writeReport(job, skillResults, finalStatus, allFindings) {
+function writeReport(job, skillResults, finalStatus, allFindings, validationInfo) {
   const dir = path.join(REPORT_DIR, job.id);
   fs.mkdirSync(dir, { recursive: true });
   const reportPath = path.join(dir, 'report.md');
-  fs.writeFileSync(reportPath, buildReport(job, skillResults, finalStatus, allFindings), 'utf8');
+  // Baca ulang rows validasi dari DB (applyValidation sudah menulis status di sana).
+  let enriched = validationInfo;
+  if (validationInfo && validationInfo.status === 'done') {
+    try {
+      const rows = db
+        .prepare('SELECT id, validation_status AS status, validation_evidence AS evidence FROM job_findings WHERE job_id = ? AND validation_status IS NOT NULL ORDER BY id')
+        .all(job.id);
+      enriched = { ...validationInfo, validatedRows: rows };
+    } catch {
+      enriched = validationInfo; // biarkan tanpa rows
+    }
+  }
+  fs.writeFileSync(reportPath, buildReport(job, skillResults, finalStatus, allFindings, enriched), 'utf8');
   console.log(`[worker] report ditulis: ${reportPath}`);
   return reportPath;
 }
@@ -662,6 +862,46 @@ async function processJob(bullJob) {
   const allDone = skillResults.every((r) => r.status === 'done');
   const failedSkills = skillResults.filter((r) => r.status === 'failed').map((r) => r.skill);
 
+  // ——— Tahap 2: validasi temuan (PoC-lite) ———
+  let validationInfo = null;
+  if (Number(job.validate) === 1 && allDone) {
+    const eligible = getEligibleFindings(jobId);
+    if (eligible.length === 0) {
+      console.log(`[worker] job ${jobId} — validasi dilewati (tidak ada temuan non-Info)`);
+      validationInfo = { status: 'skipped', reason: 'no_findings', validated: 0 };
+    } else {
+      console.log(`[worker] job ${jobId} — tahap validasi: ${eligible.length} temuan akan diverifikasi`);
+      updateJob(jobId, { status: 'running', current_skill: 'validasi-poc' });
+      let valResult;
+      try {
+        valResult = await runValidator(eligible, workDir, targetUrl);
+      } catch (err) {
+        valResult = { status: 'failed', output: `internal_error: ${err.message}` };
+      }
+      if (valResult.status === 'done') {
+        const items = parseValidationOutput(valResult.output);
+        if (items.length > 0) {
+          try {
+            applyValidation(jobId, items);
+            const nConf = items.filter((i) => i.status === 'confirmed').length;
+            const nRef = items.filter((i) => i.status === 'refuted').length;
+            console.log(`[worker] job ${jobId} — validasi selesai: ${items.length} diproses (${nConf} confirmed, ${nRef} refuted)`);
+            validationInfo = { status: 'done', validated: items.length, confirmed: nConf, refuted: nRef, output: valResult.output };
+          } catch (err) {
+            console.error(`[worker] job ${jobId} — gagal apply validation:`, err?.message ?? err);
+            validationInfo = { status: 'failed', reason: err?.message ?? 'apply_error', validated: 0 };
+          }
+        } else {
+          console.log(`[worker] job ${jobId} — output validator tanpa blok json valid`);
+          validationInfo = { status: 'failed', reason: 'no_json_block', validated: 0 };
+        }
+      } else {
+        console.log(`[worker] job ${jobId} — validator gagal: ${(valResult.output ?? '').slice(0, 200)}`);
+        validationInfo = { status: 'failed', reason: 'validator_failed', validated: 0 };
+      }
+    }
+  }
+
   // Share token: generate saat job terminal dengan report (untuk link /r/<token>).
   if (!job.share_token) {
     try {
@@ -673,14 +913,14 @@ async function processJob(bullJob) {
 
   if (allDone) {
     const freshJob = getJob(jobId);
-    const reportPath = writeReport(freshJob ?? job, skillResults, 'done', allFindings);
+    const reportPath = writeReport(freshJob ?? job, skillResults, 'done', allFindings, validationInfo);
     updateJob(jobId, { status: 'done', progress: 100, report_path: reportPath, current_skill: null });
     addAudit('job_done', jobId);
     console.log(`[worker] job ${jobId} SELESAI (done), report: ${reportPath}`);
   } else {
     const errorSummary = `skills gagal: ${failedSkills.join(', ')}`;
     const freshJob = getJob(jobId);
-    const reportPath = writeReport(freshJob ?? job, skillResults, 'failed', allFindings);
+    const reportPath = writeReport(freshJob ?? job, skillResults, 'failed', allFindings, null);
     updateJob(jobId, {
       status: 'failed',
       progress: 100,

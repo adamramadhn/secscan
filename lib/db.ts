@@ -13,6 +13,7 @@ export interface JobRow {
   instructions: string | null;
   severity_counts: string | null;
   share_token: string | null;
+  validate: number;
   status: string;
   progress: number;
   current_skill: string | null;
@@ -52,6 +53,8 @@ export interface FindingRow {
   description: string | null;
   location: string | null;
   recommendation: string | null;
+  validation_status: string | null; // confirmed|refuted|inconclusive|null (belum divalidasi)
+  validation_evidence: string | null;
   created_at: number;
 }
 
@@ -65,15 +68,16 @@ export interface CreateJobInput {
   skills_json: string;
   depth?: string;
   instructions?: string | null;
+  validate?: number;
 }
 
 export type JobPatch = Partial<
-  Pick<JobRow, 'repo_url' | 'branch' | 'target_type' | 'skills_json' | 'depth' | 'status' | 'progress' | 'current_skill' | 'report_path' | 'error'>
+  Pick<JobRow, 'repo_url' | 'branch' | 'target_type' | 'skills_json' | 'depth' | 'instructions' | 'severity_counts' | 'share_token' | 'validate' | 'status' | 'progress' | 'current_skill' | 'report_path' | 'error'>
 >;
 
 const JOB_COLUMNS = new Set([
   'repo_url', 'branch', 'target_type', 'skills_json', 'depth', 'instructions',
-  'severity_counts', 'share_token',
+  'severity_counts', 'share_token', 'validate',
   'status', 'progress', 'current_skill', 'report_path', 'error',
 ]);
 
@@ -151,6 +155,7 @@ function migrate(db: Database.Database): void {
     instructions: "TEXT",
     severity_counts: "TEXT",
     share_token: "TEXT",
+    validate: "INTEGER DEFAULT 0",
   };
   for (const [col, def] of Object.entries(colDefs)) {
     if (!jobCols.has(col)) {
@@ -172,6 +177,16 @@ function migrate(db: Database.Database): void {
     );
     CREATE INDEX IF NOT EXISTS idx_job_findings_job ON job_findings(job_id);
   `);
+  // Kolom validasi (tahap 2 PoC) — tambah bila belum ada.
+  const fCols = new Set(
+    (db.prepare('PRAGMA table_info(job_findings)').all() as { name: string }[]).map((c) => c.name),
+  );
+  if (!fCols.has('validation_status')) {
+    db.exec(`ALTER TABLE job_findings ADD COLUMN validation_status TEXT`);
+  }
+  if (!fCols.has('validation_evidence')) {
+    db.exec(`ALTER TABLE job_findings ADD COLUMN validation_evidence TEXT`);
+  }
 }
 
 export function createJob(input: CreateJobInput): JobRow {
@@ -179,9 +194,9 @@ export function createJob(input: CreateJobInput): JobRow {
   const now = Date.now();
   const id = uuidv4();
   db.prepare(
-    `INSERT INTO jobs (id, repo_url, branch, target_type, skills_json, depth, instructions, status, progress, created_at, updated_at)
-     VALUES (@id, @repo_url, @branch, @target_type, @skills_json, @depth, @instructions, 'queued', 0, @now, @now)`
-  ).run({ id, ...input, depth: input.depth ?? 'medium', instructions: input.instructions ?? null, now });
+    `INSERT INTO jobs (id, repo_url, branch, target_type, skills_json, depth, instructions, validate, status, progress, created_at, updated_at)
+     VALUES (@id, @repo_url, @branch, @target_type, @skills_json, @depth, @instructions, @validate, 'queued', 0, @now, @now)`
+  ).run({ id, ...input, depth: input.depth ?? 'medium', instructions: input.instructions ?? null, validate: input.validate ?? 0, now });
   return getJob(id)!;
 }
 

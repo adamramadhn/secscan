@@ -20,6 +20,7 @@ interface JobBody {
   skills?: unknown;
   depth?: unknown;
   instructions?: unknown;
+  validate?: unknown;
   confirmOfensif?: unknown;
 }
 
@@ -57,6 +58,9 @@ export const POST = withAuth(async (req: Request) => {
     }
     instructions = cleaned.length > 0 ? cleaned : null;
   }
+
+  // Opsi validasi temuan (tahap 2 PoC-lite) — boolean.
+  const validate = body.validate === true ? 1 : 0;
 
   let repoUrl = '';
   let branch = 'main';
@@ -104,6 +108,7 @@ export const POST = withAuth(async (req: Request) => {
     skills_json: JSON.stringify(skills),
     depth,
     instructions,
+    validate,
   });
 
   if (targetType === 'url') {
