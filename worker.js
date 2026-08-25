@@ -1293,6 +1293,14 @@ async function runScheduledJob(schedule) {
       console.error(`[scheduler] clone gagal utk jadwal '${schedule.name}': ${clone.error}`);
       return null;
     }
+  } else {
+    // Target URL live: worker butuh workdir ada (meski tanpa clone).
+    try {
+      fs.mkdirSync(path.join(WORK_DIR, jobId), { recursive: true });
+    } catch (err) {
+      updateJob(jobId, { status: 'failed', error: `mkdir_failed: ${err?.message ?? err}` });
+      return null;
+    }
   }
   try {
     await scanQueue.add('scan', { jobId }, { jobId, attempts: 3, backoff: { type: 'exponential', delay: 15_000 } });
