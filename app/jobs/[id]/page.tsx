@@ -18,6 +18,7 @@ import StatusBadge from '@/components/StatusBadge';
 import Progress from '@/components/Progress';
 import FindingsPanel from '@/components/FindingsPanel';
 import FixesPanel from '@/components/FixesPanel';
+import CompliancePanel from '@/components/CompliancePanel';
 
 function relativeTime(ts: number): string {
   const diff = Math.max(0, Date.now() - ts);
@@ -399,6 +400,7 @@ export default function JobDetailPage() {
         {/* Temuan terstruktur (muncul live saat skill selesai) */}
         <FindingsPanel findings={findings} />
         {fixes.length > 0 && <FixesPanel fixes={fixes} jobId={id} />}
+        {job.status === 'done' && <CompliancePanel job={job} findings={findings} />}
 
         {/* Daftar skill */}
         <div className="flex flex-col gap-3">
