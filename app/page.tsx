@@ -75,6 +75,12 @@ export default function DashboardPage() {
           </div>
           <div className="flex items-center gap-3">
             <Link
+              href="/schedules"
+              className="rounded-lg border border-zinc-800 px-3.5 py-2 text-sm text-zinc-400 transition hover:border-zinc-700 hover:text-zinc-200"
+            >
+              Jadwal
+            </Link>
+            <Link
               href="/new"
               className="rounded-lg bg-emerald-500 px-3.5 py-2 text-sm font-semibold text-zinc-950 transition hover:bg-emerald-400"
             >

@@ -5,6 +5,7 @@ import Link from 'next/link';
 import { useParams } from 'next/navigation';
 import {
   ApiError,
+  createScheduleApi,
   downloadReportUrl,
   eventSourceUrl,
   getJob,
@@ -48,6 +49,46 @@ export default function JobDetailPage() {
   const [loading, setLoading] = useState(true);
   const [live, setLive] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [scheduleModalOpen, setScheduleModalOpen] = useState(false);
+  const [scheduleName, setScheduleName] = useState('');
+  const [scheduleInterval, setScheduleInterval] = useState(1440);
+  const [scheduling, setScheduling] = useState(false);
+  const [scheduleError, setScheduleError] = useState<string | null>(null);
+
+  function openScheduleModal() {
+    setScheduleError(null);
+    setScheduleName(
+      `Scan ${job?.target_type === 'url' ? 'URL' : (job?.repo_url ?? '').split('/').slice(-1)[0] ?? 'berkala'}`
+    );
+    setScheduleInterval(1440);
+    setScheduleModalOpen(true);
+  }
+
+  async function handleCreateSchedule() {
+    if (!job) return;
+    setScheduling(true);
+    setScheduleError(null);
+    try {
+      await createScheduleApi({
+        name: scheduleName.trim(),
+        repoUrl: job.repo_url,
+        branch: job.branch,
+        targetType: job.target_type === 'url' ? 'url' : 'github',
+        skills: job.skills,
+        depth: job.depth,
+        instructions: job.instructions,
+        validate: job.validate === 1,
+        autoFix: job.auto_fix === 1,
+        diffBase: job.diff_base ?? undefined,
+        intervalMinutes: scheduleInterval,
+      });
+      setScheduleModalOpen(false);
+    } catch (err) {
+      setScheduleError(err instanceof Error ? err.message : 'Gagal membuat jadwal');
+    } finally {
+      setScheduling(false);
+    }
+  }
 
   // Sinkronkan state dari snapshot { job, jobSkills, findings }.
   const applySnapshot = useCallback((data: { job: Job; jobSkills: JobSkill[]; findings?: Finding[]; fixes?: Fix[] }) => {
@@ -207,8 +248,72 @@ export default function JobDetailPage() {
               {copied ? '✓ Tersalin' : 'Share Link'}
             </button>
           )}
+          <button
+            onClick={openScheduleModal}
+            className="rounded-lg border border-sky-500/40 bg-sky-500/10 px-3.5 py-2 text-sm text-sky-300 transition hover:bg-sky-500/20"
+          >
+            Jadwalkan
+          </button>
         </div>
       </header>
+
+      {scheduleModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4">
+          <div className="w-full max-w-md rounded-xl border border-zinc-800 bg-zinc-900 p-6">
+            <h2 className="text-sm font-semibold text-zinc-100">Jadwalkan Scan Berkala</h2>
+            <p className="mt-1.5 text-xs leading-relaxed text-zinc-500">
+              Konfigurasi job ini (target, skill, opsi) akan diulang otomatis sesuai interval.
+            </p>
+            <label className="mt-4 flex flex-col gap-1.5">
+              <span className="text-xs font-medium uppercase tracking-wide text-zinc-500">Nama jadwal</span>
+              <input
+                type="text"
+                value={scheduleName}
+                onChange={(e) => setScheduleName(e.target.value)}
+                placeholder="mis. Mingguan dams-index"
+                className="rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm text-zinc-200 placeholder:text-zinc-600 focus:border-sky-500/60 focus:outline-none"
+              />
+            </label>
+            <div className="mt-4 flex flex-col gap-1.5">
+              <span className="text-xs font-medium uppercase tracking-wide text-zinc-500">Interval</span>
+              <div className="grid grid-cols-4 gap-2">
+                {[360, 720, 1440, 10080].map((m) => {
+                  const labels: Record<number, string> = { 360: '6 jam', 720: '12 jam', 1440: '1 hari', 10080: '7 hari' };
+                  return (
+                    <button
+                      key={m}
+                      onClick={() => setScheduleInterval(m)}
+                      className={`rounded-lg border px-2 py-2 text-xs transition ${
+                        scheduleInterval === m
+                          ? 'border-sky-500/60 bg-sky-500/15 text-sky-300'
+                          : 'border-zinc-800 text-zinc-400 hover:border-zinc-700'
+                      }`}
+                    >
+                      {labels[m]}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+            <div className="mt-6 flex justify-end gap-2">
+              <button
+                onClick={() => setScheduleModalOpen(false)}
+                className="rounded-lg border border-zinc-800 px-3.5 py-2 text-sm text-zinc-400 transition hover:border-zinc-700"
+              >
+                Batal
+              </button>
+              <button
+                onClick={handleCreateSchedule}
+                disabled={scheduling || scheduleName.trim().length === 0}
+                className="rounded-lg bg-sky-500 px-3.5 py-2 text-sm font-semibold text-zinc-950 transition hover:bg-sky-400 disabled:opacity-40"
+              >
+                {scheduling ? 'Menyimpan…' : 'Simpan Jadwal'}
+              </button>
+            </div>
+            {scheduleError && <p className="mt-3 text-xs text-red-400">{scheduleError}</p>}
+          </div>
+        </div>
+      )}
 
       <div className="mx-auto flex max-w-4xl flex-col gap-6 px-6 py-10">
         {/* Ringkasan job */}

@@ -29,7 +29,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 
-const { Worker } = require('bullmq');
+const { Worker, Queue } = require('bullmq');
 const IORedis = require('ioredis');
 const Database = require('better-sqlite3');
 
@@ -133,6 +133,28 @@ function migrate() {
   if (!cols.includes('validate')) db.prepare("ALTER TABLE jobs ADD COLUMN validate INTEGER DEFAULT 0").run();
   if (!cols.includes('auto_fix')) db.prepare("ALTER TABLE jobs ADD COLUMN auto_fix INTEGER DEFAULT 0").run();
   if (!cols.includes('diff_base')) db.prepare("ALTER TABLE jobs ADD COLUMN diff_base TEXT").run();
+  if (!cols.includes('schedule_id')) db.prepare("ALTER TABLE jobs ADD COLUMN schedule_id TEXT").run();
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS schedules (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      repo_url TEXT NOT NULL,
+      branch TEXT NOT NULL DEFAULT 'main',
+      target_type TEXT NOT NULL DEFAULT 'github',
+      skills_json TEXT NOT NULL,
+      depth TEXT NOT NULL DEFAULT 'medium',
+      instructions TEXT,
+      validate INTEGER NOT NULL DEFAULT 0,
+      auto_fix INTEGER NOT NULL DEFAULT 0,
+      diff_base TEXT,
+      interval_minutes INTEGER NOT NULL DEFAULT 1440,
+      last_run_at INTEGER,
+      last_job_id TEXT,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    )
+  `);
   db.exec(`
     CREATE TABLE IF NOT EXISTS job_findings (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -170,7 +192,7 @@ function getJob(id) {
 
 function updateJob(id, patch) {
   const allowed = new Set(['repo_url', 'branch', 'target_type', 'skills_json', 'depth',
-    'instructions', 'severity_counts', 'share_token', 'validate', 'auto_fix', 'diff_base',
+    'instructions', 'severity_counts', 'share_token', 'validate', 'auto_fix', 'diff_base', 'schedule_id',
     'status', 'progress', 'current_skill', 'report_path', 'error']);
   const entries = Object.entries(patch).filter(([k, v]) => allowed.has(k) && v !== undefined);
   if (entries.length === 0) return getJob(id);
@@ -1196,13 +1218,122 @@ async function processJob(bullJob) {
 /* ------------------------------------------------------------------ */
 
 const connection = new IORedis(REDIS_URL, { maxRetriesPerRequest: null });
+const scanQueue = new Queue(QUEUE_NAME, { connection });
 const WORKER_CONCURRENCY = Math.max(1, Math.min(Number(process.env.WORKER_CONCURRENCY ?? 2), 5));
 const worker = new Worker(QUEUE_NAME, processJob, {
   connection,
   concurrency: WORKER_CONCURRENCY,
 });
 
-worker.on('ready', () => console.log(`[worker] ready — queue '${QUEUE_NAME}' concurrency=${WORKER_CONCURRENCY} (redis ${REDIS_URL})`));
+/* ------------------------------------------------------------------ */
+/* Scheduler — jadwal scan berkala (tabel schedules)                    */
+/* ------------------------------------------------------------------ */
+
+const SCHEDULER_TICK_MS = 60_000;
+
+/** Query jadwal jatuh tempo. */
+function dueSchedules(now) {
+  return db
+    .prepare(
+      `SELECT * FROM schedules
+       WHERE enabled = 1
+         AND (last_run_at IS NULL OR last_run_at <= ? - interval_minutes * 60000)`
+    )
+    .all(now);
+}
+
+/** Job aktif milik schedule (queued/running). */
+function activeJobOfSchedule(scheduleId) {
+  return (
+    db
+      .prepare(
+        `SELECT * FROM jobs WHERE schedule_id = ? AND status IN ('queued','running') ORDER BY created_at DESC LIMIT 1`
+      )
+      .get(scheduleId) ?? null
+  );
+}
+
+/** Clone shallow untuk job scheduled (port lib/clone.ts). */
+function cloneRepoSync(repoUrl, branch, destDir) {
+  try {
+    fs.rmSync(destDir, { recursive: true, force: true });
+    fs.mkdirSync(destDir, { recursive: true });
+    execFileSync('git', ['clone', '--depth', '1', '--branch', branch || 'main', repoUrl, destDir], {
+      stdio: 'pipe',
+      timeout: 120_000,
+      killSignal: 'SIGKILL',
+    });
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: String(err?.message ?? err).slice(0, 500) };
+  }
+}
+
+/** Jalankan satu job scheduled: buat row job → clone → enqueue. */
+async function runScheduledJob(schedule) {
+  const jobId = crypto.randomUUID();
+  const now = Date.now();
+  db.prepare(
+    `INSERT INTO jobs (id, repo_url, branch, target_type, skills_json, depth, instructions, validate, auto_fix, diff_base, schedule_id, status, progress, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?)`
+  ).run(jobId, schedule.repo_url, schedule.branch, schedule.target_type, schedule.skills_json,
+    schedule.depth, schedule.instructions, schedule.validate, schedule.auto_fix, schedule.diff_base,
+    schedule.id, now, now);
+  db.prepare('UPDATE schedules SET last_run_at = ?, last_job_id = ?, updated_at = ? WHERE id = ?')
+    .run(now, jobId, now, schedule.id);
+  addAudit('schedule_run', jobId);
+  console.log(`[scheduler] jadwal '${schedule.name}' → job ${jobId}`);
+
+  if (schedule.target_type === 'github') {
+    const workDir = path.join(WORK_DIR, jobId);
+    const clone = cloneRepoSync(schedule.repo_url, schedule.branch, workDir);
+    if (!clone.ok) {
+      updateJob(jobId, { status: 'failed', error: `clone_failed: ${clone.error}` });
+      addAudit('job_clone_failed', jobId);
+      console.error(`[scheduler] clone gagal utk jadwal '${schedule.name}': ${clone.error}`);
+      return null;
+    }
+  }
+  try {
+    await scanQueue.add('scan', { jobId }, { jobId, attempts: 3, backoff: { type: 'exponential', delay: 15_000 } });
+    return jobId;
+  } catch (err) {
+    updateJob(jobId, { status: 'failed', error: `enqueue_failed: ${err?.message ?? err}` });
+    console.error(`[scheduler] enqueue gagal utk jadwal '${schedule.name}':`, err?.message ?? err);
+    return null;
+  }
+}
+
+let schedulerTimer = null;
+
+async function schedulerTick() {
+  try {
+    const due = dueSchedules(Date.now());
+    for (const s of due) {
+      const active = activeJobOfSchedule(s.id);
+      if (active) {
+        console.log(`[scheduler] jadwal '${s.name}' dilewati — job ${active.id} masih ${active.status}`);
+        continue;
+      }
+      await runScheduledJob(s);
+    }
+  } catch (err) {
+    console.error('[scheduler] tick error:', err?.message ?? err);
+  }
+}
+
+function startScheduler() {
+  if (schedulerTimer) return;
+  schedulerTimer = setInterval(schedulerTick, SCHEDULER_TICK_MS);
+  // tick pertama setelah 5 detik (biar worker siap)
+  setTimeout(schedulerTick, 5_000).unref?.();
+  console.log(`[scheduler] aktif — cek jadwal tiap ${SCHEDULER_TICK_MS / 1000}s`);
+}
+
+worker.on('ready', () => {
+  console.log(`[worker] ready — queue '${QUEUE_NAME}' concurrency=${WORKER_CONCURRENCY} (redis ${REDIS_URL})`);
+  startScheduler();
+});
 worker.on('completed', (j) => console.log(`[worker] bullmq completed: ${j.id}`));
 worker.on('failed', (j, err) => {
   const jobId = j?.data?.jobId;

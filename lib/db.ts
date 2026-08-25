@@ -15,6 +15,8 @@ export interface JobRow {
   share_token: string | null;
   validate: number;
   auto_fix: number;
+  diff_base: string | null;
+  schedule_id: string | null;
   status: string;
   progress: number;
   current_skill: string | null;
@@ -84,12 +86,12 @@ export interface CreateJobInput {
 }
 
 export type JobPatch = Partial<
-  Pick<JobRow, 'repo_url' | 'branch' | 'target_type' | 'skills_json' | 'depth' | 'instructions' | 'severity_counts' | 'share_token' | 'validate' | 'status' | 'progress' | 'current_skill' | 'report_path' | 'error'>
+  Pick<JobRow, 'repo_url' | 'branch' | 'target_type' | 'skills_json' | 'depth' | 'instructions' | 'severity_counts' | 'share_token' | 'validate' | 'auto_fix' | 'diff_base' | 'schedule_id' | 'status' | 'progress' | 'current_skill' | 'report_path' | 'error'>
 >;
 
 const JOB_COLUMNS = new Set([
   'repo_url', 'branch', 'target_type', 'skills_json', 'depth', 'instructions',
-  'severity_counts', 'share_token', 'validate', 'auto_fix',
+  'severity_counts', 'share_token', 'validate', 'auto_fix', 'diff_base', 'schedule_id',
   'status', 'progress', 'current_skill', 'report_path', 'error',
 ]);
 
@@ -170,12 +172,34 @@ function migrate(db: Database.Database): void {
     validate: "INTEGER DEFAULT 0",
     auto_fix: "INTEGER DEFAULT 0",
     diff_base: "TEXT",
+    schedule_id: "TEXT",
   };
   for (const [col, def] of Object.entries(colDefs)) {
     if (!jobCols.has(col)) {
       db.prepare(`ALTER TABLE jobs ADD COLUMN ${col} ${def}`).run();
     }
   }
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS schedules (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      repo_url TEXT NOT NULL,
+      branch TEXT NOT NULL DEFAULT 'main',
+      target_type TEXT NOT NULL DEFAULT 'github',
+      skills_json TEXT NOT NULL,
+      depth TEXT NOT NULL DEFAULT 'medium',
+      instructions TEXT,
+      validate INTEGER NOT NULL DEFAULT 0,
+      auto_fix INTEGER NOT NULL DEFAULT 0,
+      diff_base TEXT,
+      interval_minutes INTEGER NOT NULL DEFAULT 1440,
+      last_run_at INTEGER,
+      last_job_id TEXT,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    )
+  `);
   db.exec(`
     CREATE TABLE IF NOT EXISTS job_findings (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -229,6 +253,111 @@ export function createJob(input: CreateJobInput): JobRow {
 export function getJob(id: string): JobRow | null {
   const row = getDb().prepare('SELECT * FROM jobs WHERE id = ?').get(id) as JobRow | undefined;
   return row ?? null;
+}
+
+export interface ScheduleRow {
+  id: string;
+  name: string;
+  repo_url: string;
+  branch: string;
+  target_type: string;
+  skills_json: string;
+  depth: string;
+  instructions: string | null;
+  validate: number;
+  auto_fix: number;
+  diff_base: string | null;
+  interval_minutes: number;
+  last_run_at: number | null;
+  last_job_id: string | null;
+  enabled: number;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface CreateScheduleInput {
+  name: string;
+  repo_url: string;
+  branch: string;
+  target_type: string;
+  skills_json: string;
+  depth?: string;
+  instructions?: string | null;
+  validate?: number;
+  auto_fix?: number;
+  diff_base?: string | null;
+  interval_minutes?: number;
+}
+
+export function listSchedules(): ScheduleRow[] {
+  return getDb().prepare('SELECT * FROM schedules ORDER BY created_at DESC').all() as ScheduleRow[];
+}
+
+export function getSchedule(id: string): ScheduleRow | null {
+  return (getDb().prepare('SELECT * FROM schedules WHERE id = ?').get(id) as ScheduleRow) ?? null;
+}
+
+export function createSchedule(input: CreateScheduleInput): ScheduleRow {
+  const db = getDb();
+  const now = Date.now();
+  const id = uuidv4();
+  db.prepare(
+    `INSERT INTO schedules (id, name, repo_url, branch, target_type, skills_json, depth, instructions, validate, auto_fix, diff_base, interval_minutes, enabled, created_at, updated_at)
+     VALUES (@id, @name, @repo_url, @branch, @target_type, @skills_json, @depth, @instructions, @validate, @auto_fix, @diff_base, @interval_minutes, 1, @now, @now)`
+  ).run({
+    ...input,
+    id,
+    now,
+    depth: input.depth ?? 'medium',
+    instructions: input.instructions ?? null,
+    validate: input.validate ?? 0,
+    auto_fix: input.auto_fix ?? 0,
+    diff_base: input.diff_base ?? null,
+    interval_minutes: input.interval_minutes ?? 1440,
+  });
+  return getSchedule(id)!;
+}
+
+const SCHEDULE_COLUMNS = new Set([
+  'name', 'repo_url', 'branch', 'target_type', 'skills_json', 'depth', 'instructions',
+  'validate', 'auto_fix', 'diff_base', 'interval_minutes', 'last_run_at', 'last_job_id',
+  'enabled', 'updated_at',
+]);
+
+export function updateSchedule(id: string, patch: Partial<ScheduleRow>): ScheduleRow | null {
+  const db = getDb();
+  const entries = Object.entries(patch).filter(([k, v]) => SCHEDULE_COLUMNS.has(k) && v !== undefined);
+  if (entries.length === 0) return getSchedule(id);
+  const set = entries.map(([k]) => `${k} = @${k}`).join(', ');
+  db.prepare(`UPDATE schedules SET ${set} WHERE id = @id`).run({ ...Object.fromEntries(entries), id });
+  return getSchedule(id);
+}
+
+export function deleteSchedule(id: string): boolean {
+  const res = getDb().prepare('DELETE FROM schedules WHERE id = ?').run(id);
+  return res.changes > 0;
+}
+
+/** Jadwal yang sudah jatuh tempo (enabled, belum pernah jalan atau lewat interval). */
+export function dueSchedules(now: number): ScheduleRow[] {
+  return getDb()
+    .prepare(
+      `SELECT * FROM schedules
+       WHERE enabled = 1
+         AND (last_run_at IS NULL OR last_run_at <= ? - interval_minutes * 60000)`
+    )
+    .all(now) as ScheduleRow[];
+}
+
+/** Job aktif terakhir milik sebuah schedule (queued/running). */
+export function activeJobOfSchedule(scheduleId: string): JobRow | null {
+  return (
+    (getDb()
+      .prepare(
+        `SELECT j.* FROM jobs j WHERE j.schedule_id = ? AND j.status IN ('queued','running') ORDER BY j.created_at DESC LIMIT 1`
+      )
+      .get(scheduleId) as JobRow) ?? null
+  );
 }
 
 export function listJobs(): JobRow[] {

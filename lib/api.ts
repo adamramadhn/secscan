@@ -176,6 +176,78 @@ export function downloadReportUrl(id: string): string {
   return `/api/jobs/${encodeURIComponent(id)}/report`;
 }
 
+export interface Schedule {
+  id: string;
+  name: string;
+  repo_url: string;
+  branch: string;
+  target_type: string;
+  skills: string[];
+  depth: string;
+  instructions: string | null;
+  validate: number;
+  auto_fix: number;
+  diff_base: string | null;
+  interval_minutes: number;
+  last_run_at: number | null;
+  last_job_id: string | null;
+  enabled: number;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface CreateScheduleBody {
+  name: string;
+  repoUrl: string;
+  branch: string;
+  targetType: 'github' | 'url';
+  skills: string[];
+  depth: string;
+  instructions?: string | null;
+  validate?: boolean;
+  autoFix?: boolean;
+  diffBase?: string;
+  intervalMinutes: number;
+}
+
+/** GET /api/schedules → { schedules } */
+export function getSchedules(): Promise<{ schedules: Schedule[] }> {
+  return request<{ schedules: Schedule[] }>('/api/schedules');
+}
+
+/** POST /api/schedules → { schedule } */
+export function createScheduleApi(body: CreateScheduleBody): Promise<{ schedule: Schedule }> {
+  return request<{ schedule: Schedule }>('/api/schedules', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+}
+
+/** PATCH /api/schedules/[id] */
+export function patchSchedule(
+  id: string,
+  body: { enabled?: boolean; intervalMinutes?: number; name?: string },
+): Promise<{ schedule: Schedule }> {
+  return request<{ schedule: Schedule }>(`/api/schedules/${encodeURIComponent(id)}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+}
+
+/** DELETE /api/schedules/[id] */
+export function deleteScheduleApi(id: string): Promise<{ ok: boolean }> {
+  return request<{ ok: boolean }>(`/api/schedules/${encodeURIComponent(id)}`, { method: 'DELETE' });
+}
+
+/** POST /api/schedules/[id]/run — jalankan sekarang (≤60s via scheduler). */
+export function runScheduleNow(id: string): Promise<{ ok: boolean; note?: string }> {
+  return request<{ ok: boolean; note?: string }>(`/api/schedules/${encodeURIComponent(id)}/run`, {
+    method: 'POST',
+  });
+}
+
 /** URL EventSource (SSE live) untuk sebuah job. */
 export function eventSourceUrl(id: string): string {
   return `/api/jobs/${encodeURIComponent(id)}/stream`;
