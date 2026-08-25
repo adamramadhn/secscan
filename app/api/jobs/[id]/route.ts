@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server';
 import { withAuth } from '@/lib/require-auth';
-import { getJob, getJobSkills, getJobFindings, getJobFixes } from '@/lib/db';
+import { getJob, getJobSkills, getJobFindings, getJobFixes, getKnowledgeForTarget, targetKey } from '@/lib/db';
 
 export const GET = withAuth(async (_req: Request, ctx) => {
   const { id } = await ctx!.params;
@@ -21,5 +21,6 @@ export const GET = withAuth(async (_req: Request, ctx) => {
     jobSkills: getJobSkills(id),
     findings: getJobFindings(id),
     fixes: getJobFixes(id),
+    knowledge: getKnowledgeForTarget(targetKey(job)),
   });
 });

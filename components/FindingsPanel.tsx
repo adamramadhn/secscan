@@ -119,6 +119,14 @@ export default function FindingsPanel({ findings }: { findings: Finding[] }) {
                   </span>
                   <span className="flex shrink-0 items-center gap-2.5">
                     {f.validation_status && <ValidationBadge status={f.validation_status} />}
+                    {f.seen_count != null && f.seen_count >= 2 && (
+                      <span
+                        className="rounded-md border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-xs font-medium text-amber-300"
+                        title="Terulang di beberapa scan — kemungkinan belum diperbaiki / regresi"
+                      >
+                        berulang ×{f.seen_count}
+                      </span>
+                    )}
                     <span className="rounded-md bg-zinc-800/70 px-2 py-0.5 font-mono text-xs text-zinc-400">
                       {f.skill}
                     </span>

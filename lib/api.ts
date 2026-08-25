@@ -69,6 +69,7 @@ export interface Finding {
   recommendation: string | null;
   validation_status: ValidationStatus | null;
   validation_evidence: string | null;
+  seen_count?: number;
   created_at: number;
 }
 

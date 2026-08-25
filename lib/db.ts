@@ -51,13 +51,14 @@ export interface FindingRow {
   id: number;
   job_id: string;
   skill: string;
-  severity: string; // Critical|High|Medium|Low|Info
+  severity: string;
   title: string;
   description: string | null;
   location: string | null;
   recommendation: string | null;
-  validation_status: string | null; // confirmed|refuted|inconclusive|null (belum divalidasi)
+  validation_status: string | null;
   validation_evidence: string | null;
+  seen_count?: number;
   created_at: number;
 }
 
@@ -215,6 +216,35 @@ function migrate(db: Database.Database): void {
     );
     CREATE INDEX IF NOT EXISTS idx_job_findings_job ON job_findings(job_id);
   `);
+  // ——— Tabel knowledge (continuous learning) ———
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS knowledge (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      target_key TEXT NOT NULL,
+      key TEXT NOT NULL,
+      title TEXT NOT NULL,
+      severity TEXT NOT NULL DEFAULT 'Info',
+      seen_count INTEGER NOT NULL DEFAULT 1,
+      last_seen_at INTEGER NOT NULL,
+      first_seen_at INTEGER NOT NULL,
+      last_job_id TEXT,
+      created_at INTEGER NOT NULL,
+      UNIQUE (target_key, key)
+    );
+    CREATE INDEX IF NOT EXISTS idx_knowledge_target ON knowledge(target_key);
+  `);
+  // ——— Tabel target_knowledge (konteks per target, input ke prompt) ———
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS target_knowledge (
+      target_key TEXT PRIMARY KEY,
+      context TEXT,
+      findings_learned INTEGER NOT NULL DEFAULT 0,
+      jobs_count INTEGER NOT NULL DEFAULT 1,
+      first_job_at INTEGER NOT NULL,
+      last_job_at INTEGER NOT NULL,
+      last_finding_at INTEGER NOT NULL
+    );
+  `);
   // Kolom validasi (tahap 2 PoC) — tambah bila belum ada.
   const fCols = new Set(
     (db.prepare('PRAGMA table_info(job_findings)').all() as { name: string }[]).map((c) => c.name),
@@ -224,6 +254,9 @@ function migrate(db: Database.Database): void {
   }
   if (!fCols.has('validation_evidence')) {
     db.exec(`ALTER TABLE job_findings ADD COLUMN validation_evidence TEXT`);
+  }
+  if (!fCols.has('seen_count')) {
+    db.exec(`ALTER TABLE job_findings ADD COLUMN seen_count INTEGER NOT NULL DEFAULT 1`);
   }
   db.exec(`
     CREATE TABLE IF NOT EXISTS job_fixes (
@@ -289,6 +322,20 @@ export interface CreateScheduleInput {
   interval_minutes?: number;
 }
 
+/** Buat jadwal berkala (scheduled scan). */
+export function createFromSchedule(s: ScheduleRow, jobId: string): JobRow {
+  const db = getDb();
+  const now = Date.now();
+  db.prepare(
+    `INSERT INTO jobs (id, repo_url, branch, target_type, skills_json, depth, instructions, validate, auto_fix, diff_base, schedule_id, status, progress, created_at, updated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', 0, ?, ?)`
+  ).run(
+    jobId, s.repo_url, s.branch, s.target_type, s.skills_json, s.depth,
+    s.instructions, s.validate, s.auto_fix, s.diff_base, s.id, now, now,
+  );
+  return getJob(jobId)!;
+}
+
 export function listSchedules(): ScheduleRow[] {
   return getDb().prepare('SELECT * FROM schedules ORDER BY created_at DESC').all() as ScheduleRow[];
 }
@@ -336,6 +383,90 @@ export function updateSchedule(id: string, patch: Partial<ScheduleRow>): Schedul
 export function deleteSchedule(id: string): boolean {
   const res = getDb().prepare('DELETE FROM schedules WHERE id = ?').run(id);
   return res.changes > 0;
+}
+
+export interface KnowledgeRow {
+  id: number;
+  target_key: string;
+  key: string;
+  title: string;
+  severity: string;
+  seen_count: number;
+  last_seen_at: number;
+  first_seen_at: number;
+  last_job_id: string | null;
+  created_at: number;
+}
+
+export interface TargetKnowledgeRow {
+  target_key: string;
+  context: string | null;
+  findings_learned: number;
+  jobs_count: number;
+  first_job_at: number;
+  last_job_at: number;
+  last_finding_at: number;
+}
+
+/** Key deterministik per target: `${target_type}:${normalized_url}`. */
+export function targetKey(job: { repo_url: string; target_type: string }): string {
+  const norm = job.repo_url.trim().toLowerCase().replace(/\/+$/, '');
+  return `${job.target_type}:${norm}`;
+}
+
+/** Belajar dari temuan job: upsert fingerprint per (target, judul) + stats target. */
+export function learnFindings(
+  jobId: string,
+  job: { repo_url: string; target_type: string },
+  findings: { title: string; severity: string }[],
+): void {
+  const db = getDb();
+  const now = Date.now();
+  const tKey = targetKey(job);
+  const upsert = db.prepare(
+    `INSERT INTO knowledge (target_key, key, title, severity, seen_count, last_seen_at, first_seen_at, last_job_id, created_at)
+     VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?)
+     ON CONFLICT (target_key, key) DO UPDATE SET
+       seen_count = seen_count + 1,
+       last_seen_at = excluded.last_seen_at,
+       last_job_id = excluded.last_job_id,
+       title = excluded.title,
+       severity = excluded.severity`
+  );
+  for (const f of findings) {
+    const key = f.title.trim().toLowerCase().replace(/\s+/g, ' ').slice(0, 200);
+    if (!key) continue;
+    upsert.run(tKey, key, f.title.trim(), f.severity, now, now, jobId, now);
+  }
+  const prev = db
+    .prepare('SELECT findings_learned FROM target_knowledge WHERE target_key = ?')
+    .get(tKey) as { findings_learned: number } | undefined;
+  db.prepare(
+    `INSERT INTO target_knowledge (target_key, findings_learned, jobs_count, first_job_at, last_job_at, last_finding_at)
+     VALUES (?, ?, 1, ?, ?, ?)
+     ON CONFLICT (target_key) DO UPDATE SET
+       findings_learned = excluded.findings_learned,
+       jobs_count = jobs_count + 1,
+       last_job_at = excluded.last_job_at,
+       last_finding_at = excluded.last_finding_at`
+  ).run(tKey, (prev?.findings_learned ?? 0) + findings.length, now, now, now);
+}
+
+/** Riwayat knowledge per target — urut jumlah kemunculan. */
+export function getKnowledgeForTarget(tKey: string): KnowledgeRow[] {
+  return getDb()
+    .prepare('SELECT * FROM knowledge WHERE target_key = ? ORDER BY seen_count DESC, last_seen_at DESC LIMIT 100')
+    .all(tKey) as KnowledgeRow[];
+}
+
+/** Konteks pembelajaran per target untuk prompt scan. */
+export function getTargetKnowledge(tKey: string): TargetKnowledgeRow | null {
+  return (getDb().prepare('SELECT * FROM target_knowledge WHERE target_key = ?').get(tKey) as TargetKnowledgeRow) ?? null;
+}
+
+/** Amati knowledge semua target (analisis). */
+export function listAllKnowledge(): KnowledgeRow[] {
+  return getDb().prepare('SELECT * FROM knowledge ORDER BY seen_count DESC LIMIT 200').all() as KnowledgeRow[];
 }
 
 /** Jadwal yang sudah jatuh tempo (enabled, belum pernah jalan atau lewat interval). */

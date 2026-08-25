@@ -33,6 +33,49 @@ const { Worker, Queue } = require('bullmq');
 const IORedis = require('ioredis');
 const Database = require('better-sqlite3');
 
+/** Normalisasi judul menjadi fingerprint stabil untuk knowledge. */
+function knowledgeKey(title) {
+  return String(title).trim().toLowerCase().replace(/\s+/g, ' ').slice(0, 200);
+}
+/** Key deterministik per target (sama dgn lib/db.ts). */
+function targetKey(job) {
+  return `${job.target_type}:${String(job.repo_url).trim().toLowerCase().replace(/\/+$/, '')}`;
+}
+/** Belajar dari temuan: upsert ke knowledge (counter + timestamp). */
+function learnFindings(jobId, job, findings) {
+  const now = Date.now();
+  const tKey = targetKey(job);
+  const upsert = db.prepare(
+    `INSERT INTO knowledge (target_key, key, title, severity, seen_count, last_seen_at, first_seen_at, last_job_id, created_at)
+     VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?)
+     ON CONFLICT (target_key, key) DO UPDATE SET
+       seen_count = seen_count + 1,
+       last_seen_at = excluded.last_seen_at,
+       last_job_id = excluded.last_job_id,
+       title = excluded.title,
+       severity = excluded.severity`
+  );
+  for (const f of findings) {
+    const key = knowledgeKey(f.title);
+    if (!key) continue;
+    upsert.run(tKey, key, String(f.title).trim(), f.severity ?? 'Info', now, now, jobId, now);
+  }
+  const prev = db.prepare('SELECT findings_learned FROM target_knowledge WHERE target_key = ?').get(tKey);
+  db.prepare(
+    `INSERT INTO target_knowledge (target_key, findings_learned, jobs_count, first_job_at, last_job_at, last_finding_at)
+     VALUES (?, ?, 1, ?, ?, ?)
+     ON CONFLICT (target_key) DO UPDATE SET
+       findings_learned = excluded.findings_learned,
+       jobs_count = jobs_count + 1,
+       last_job_at = excluded.last_job_at,
+       last_finding_at = excluded.last_finding_at`
+  ).run(tKey, (prev?.findings_learned ?? 0) + findings.length, now, now, now);
+}
+/** Konteks pembelajaran per target utk prompt scan berikutnya. */
+function getTargetKnowledge(tKey) {
+  return db.prepare('SELECT * FROM target_knowledge WHERE target_key = ?').get(tKey) ?? null;
+}
+
 /* ------------------------------------------------------------------ */
 /* Env: process.env menang; fallback baca .env.local (parser sederhana) */
 /* ------------------------------------------------------------------ */
@@ -183,6 +226,7 @@ function migrate() {
   const fCols = db.prepare('PRAGMA table_info(job_findings)').all().map((c) => c.name);
   if (!fCols.includes('validation_status')) db.exec(`ALTER TABLE job_findings ADD COLUMN validation_status TEXT`);
   if (!fCols.includes('validation_evidence')) db.exec(`ALTER TABLE job_findings ADD COLUMN validation_evidence TEXT`);
+  if (!fCols.includes('seen_count')) db.exec(`ALTER TABLE job_findings ADD COLUMN seen_count INTEGER NOT NULL DEFAULT 1`);
 }
 migrate();
 
@@ -243,9 +287,9 @@ function truncateOutput(raw) {
 /* runSkill: spawn `hermes -z <TASK> -s <skill> --in <workDir> --safe-mode` */
 /* ------------------------------------------------------------------ */
 
-function buildTaskPrompt(skill, depth, workDir, instructions, targetUrl, diffScope) {
+function buildTaskPrompt(skill, depth, workDir, instructions, targetUrl, diffScope, repoUrl) {
   const extra = instructions && instructions.trim()
-    ? `Instruksi khusus dari operator (WAJIB diikuti): ${instructions.trim()} `
+    ? `Instruksi khusus dari operator (WAJIB diikuti): ${instructions.trim()}`
     : '';
   const diffScopePart = diffScope
     ? `MODE DIFF-SCOPE: ini adalah review pre-merge yang CEPAT dan TERFOKUS. ` +
@@ -255,6 +299,29 @@ function buildTaskPrompt(skill, depth, workDir, instructions, targetUrl, diffSco
       `tapi temuan yang tidak berhubungan dengan diff ini DI LUAR SCOPE — jangan dilaporkan. ` +
       `Kedalaman analisis: 'light' efektif. `
     : '';
+  const learnCtx = (() => {
+    try {
+      const url = repoUrl || targetUrl;
+      if (!url) return '';
+      const tKey = `${targetUrl ? 'url' : 'github'}:${String(url).trim().toLowerCase().replace(/\/+$/, '')}`;
+      const tk = getTargetKnowledge(tKey);
+      if (!tk || tk.jobs_count < 2) return '';
+      const known = db
+        .prepare('SELECT title, severity, seen_count FROM knowledge WHERE target_key = ? ORDER BY seen_count DESC LIMIT 10')
+        .all(tKey);
+      const list = known.map((k) => `- [${k.severity}] ${k.title} (muncul ${k.seen_count}×)`).join('\n');
+      if (!list) return '';
+      return (
+        `\nKONTEKS PEMBELAJARAN (continuous learning): target ini sudah di-scan ${tk.jobs_count} kali. ` +
+        `Temuan yang berulang muncul (historis):\n${list}\n` +
+        `Catatan: temuan berulang perlu perhatian ekstra — area tersebut kemungkinan belum diperbaiki, ` +
+        `atau ada regresi. Laporkan kembali dengan fresh evidence. Bila tidak ada perubahan vs sebelumnya, ` +
+        `tetap laporkan (severity sesuai kondisi saat ini).\n`
+      );
+    } catch {
+      return '';
+    }
+  })();
   const findingFormat =
     `Format setiap temuan WAJIB konsisten agar bisa diparse otomatis: ` +
     `- **[Severity]** Judul singkat — deskripsi. Baris berikutnya: \`Lokasi: <file:baris atau URL>\` dan \`Rekomendasi: <perbaikan>\`. ` +
@@ -285,6 +352,7 @@ function buildTaskPrompt(skill, depth, workDir, instructions, targetUrl, diffSco
     `Direktori target (absolut): ${workDir} — analisis HANYA repositori di direktori tersebut; ` +
     `abaikan repo/direktori lain di luar ${workDir} meskipun tampak lebih relevan. ` +
     diffScopePart +
+    learnCtx +
     `Jalankan skill '${skill}' dengan kedalaman analisis '${depth}' terhadap repo ini. ` +
     extra +
     `Selesaikan langkah-langkah di SKILL.md skill tersebut (baca via tool skill_view jika tersedia, ` +
@@ -378,8 +446,8 @@ function runHermes({ prompt, skill, workDir, label, timeoutMs }) {
 /**
  * @returns {Promise<{status: 'done'|'failed', output: string}>}
  */
-function runSkill(skill, workDir, depth, instructions, targetUrl, diffScope) {
-  const taskPrompt = buildTaskPrompt(skill, depth, workDir, instructions, targetUrl, diffScope);
+function runSkill(skill, workDir, depth, instructions, targetUrl, diffScope, repoUrl) {
+  const taskPrompt = buildTaskPrompt(skill, depth, workDir, instructions, targetUrl, diffScope, repoUrl);
   return runHermes({ prompt: taskPrompt, skill, workDir, label: skill });
 }
 
@@ -1062,7 +1130,7 @@ async function processJob(bullJob) {
 
     let result;
     try {
-      result = await runSkill(skill, workDir, job.depth, job.instructions, targetUrl, diffScope);
+      result = await runSkill(skill, workDir, job.depth, job.instructions, targetUrl, diffScope, job.repo_url);
     } catch (err) {
       result = { status: 'failed', output: `internal_error: ${err.message}` };
     }
@@ -1192,6 +1260,43 @@ async function processJob(bullJob) {
   }
 
   if (allDone) {
+    // ——— Continuous learning: belajar dari temuan job ini ———
+    const tKey = targetKey(job);
+    try {
+      learnFindings(jobId, job, allFindings);
+      const prevKnowledge = getTargetKnowledge(tKey);
+      const seenKeys = new Set();
+      const totalJobs = prevKnowledge?.jobs_count ?? 1;
+      // Annotate temuan berulang: seen_count naik / turun (dari knowledge).
+      const upsert = db.prepare(
+        `INSERT INTO knowledge (target_key, key, title, severity, seen_count, last_seen_at, first_seen_at, last_job_id, created_at)
+         VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?)
+         ON CONFLICT (target_key, key) DO UPDATE SET
+           seen_count = seen_count + 1,
+           last_seen_at = excluded.last_seen_at,
+           last_job_id = excluded.last_job_id`
+      );
+      for (const f of allFindings) {
+        const key = knowledgeKey(f.title);
+        if (seenKeys.has(key)) continue;
+        seenKeys.add(key);
+        const row = db.prepare('SELECT seen_count FROM knowledge WHERE target_key = ? AND key = ?').get(tKey, key);
+        upsert.run(tKey, key, String(f.title).trim(), f.severity ?? 'Info', Date.now(), Date.now(), jobId, Date.now());
+        // seen_count sekarang sudah +1 (upsert di atas) → berulang bila >= 2
+        const count = row ? row.seen_count + 1 : 1;
+        if (count >= 2) {
+          db.prepare('UPDATE job_findings SET seen_count = ? WHERE job_id = ? AND title = ?').run(
+            count,
+            jobId,
+            f.title,
+          );
+        }
+      }
+      console.log(`[worker] job ${jobId} — knowledge diperbarui (${allFindings.length} temuan, total ${totalJobs} job utk target)`);
+    } catch (err) {
+      console.error('[worker] learnFindings gagal (non-fatal):', err?.message ?? err);
+    }
+
     const freshJob = getJob(jobId);
     const reportPath = writeReport(freshJob ?? job, skillResults, 'done', allFindings, validationInfo, fixInfo);
     updateJob(jobId, { status: 'done', progress: 100, report_path: reportPath, current_skill: null });
