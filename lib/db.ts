@@ -59,6 +59,10 @@ export interface FindingRow {
   validation_status: string | null;
   validation_evidence: string | null;
   seen_count?: number;
+  cve_id?: string | null;
+  cwe_id?: string | null;
+  confidence?: string | null;
+  source_tool?: string | null;
   created_at: number;
 }
 
@@ -257,6 +261,18 @@ function migrate(db: Database.Database): void {
   }
   if (!fCols.has('seen_count')) {
     db.exec(`ALTER TABLE job_findings ADD COLUMN seen_count INTEGER NOT NULL DEFAULT 1`);
+  }
+  if (!fCols.has('cve_id')) {
+    db.exec(`ALTER TABLE job_findings ADD COLUMN cve_id TEXT`);
+  }
+  if (!fCols.has('cwe_id')) {
+    db.exec(`ALTER TABLE job_findings ADD COLUMN cwe_id TEXT`);
+  }
+  if (!fCols.has('confidence')) {
+    db.exec(`ALTER TABLE job_findings ADD COLUMN confidence TEXT DEFAULT 'medium'`);
+  }
+  if (!fCols.has('source_tool')) {
+    db.exec(`ALTER TABLE job_findings ADD COLUMN source_tool TEXT DEFAULT 'hermes'`);
   }
   db.exec(`
     CREATE TABLE IF NOT EXISTS job_fixes (
@@ -546,14 +562,22 @@ export interface NewFinding {
   description?: string | null;
   location?: string | null;
   recommendation?: string | null;
+  validation_status?: string | null;
+  validation_evidence?: string | null;
+  cve_id?: string | null;
+  cwe_id?: string | null;
+  confidence?: string | null;
+  source_tool?: string | null;
 }
 
 export function insertFindings(jobId: string, findings: NewFinding[]): void {
   if (findings.length === 0) return;
   const db = getDb();
   const stmt = db.prepare(
-    `INSERT INTO job_findings (job_id, skill, severity, title, description, location, recommendation, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    `INSERT INTO job_findings (
+      job_id, skill, severity, title, description, location, recommendation,
+      validation_status, validation_evidence, cve_id, cwe_id, confidence, source_tool, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   );
   const now = Date.now();
   const tx = db.transaction((rows: NewFinding[]) => {
@@ -566,6 +590,12 @@ export function insertFindings(jobId: string, findings: NewFinding[]): void {
         f.description ?? null,
         f.location ?? null,
         f.recommendation ?? null,
+        f.validation_status ?? (f.source_tool === 'trivy' || f.source_tool === 'passive-web' ? 'confirmed' : 'candidate'),
+        f.validation_evidence ?? null,
+        f.cve_id ?? null,
+        f.cwe_id ?? null,
+        f.confidence ?? (f.source_tool === 'trivy' || f.source_tool === 'passive-web' ? 'high' : 'medium'),
+        f.source_tool ?? 'hermes',
         now,
       );
     }

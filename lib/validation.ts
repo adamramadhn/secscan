@@ -10,7 +10,7 @@
  * confirmed | refuted | inconclusive (alias diterima, unknown → inconclusive).
  */
 
-export const VALIDATION_STATUSES = ['confirmed', 'refuted', 'inconclusive'] as const;
+export const VALIDATION_STATUSES = ['candidate', 'evidence-backed', 'confirmed', 'refuted', 'inconclusive'] as const;
 export type ValidationStatus = (typeof VALIDATION_STATUSES)[number];
 
 export interface ValidatedItem {
@@ -23,6 +23,12 @@ export interface ValidatedItem {
 export const MAX_VALIDATED = 25;
 
 const STATUS_ALIASES: Record<string, ValidationStatus> = {
+  candidate: 'candidate',
+  kandidat: 'candidate',
+  'evidence-backed': 'evidence-backed',
+  'evidence_backed': 'evidence-backed',
+  evidencebacked: 'evidence-backed',
+  'terbukti-kode': 'evidence-backed',
   confirmed: 'confirmed',
   confirm: 'confirmed',
   valid: 'confirmed',

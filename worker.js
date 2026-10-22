@@ -23,11 +23,12 @@
 
 'use strict';
 
-const { spawn } = require('child_process');
-const { execFileSync } = require('child_process');
+const { spawn, execFileSync, spawnSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const dns = require('dns').promises;
+const net = require('net');
 
 const { Worker, Queue } = require('bullmq');
 const IORedis = require('ioredis');
@@ -227,6 +228,10 @@ function migrate() {
   if (!fCols.includes('validation_status')) db.exec(`ALTER TABLE job_findings ADD COLUMN validation_status TEXT`);
   if (!fCols.includes('validation_evidence')) db.exec(`ALTER TABLE job_findings ADD COLUMN validation_evidence TEXT`);
   if (!fCols.includes('seen_count')) db.exec(`ALTER TABLE job_findings ADD COLUMN seen_count INTEGER NOT NULL DEFAULT 1`);
+  if (!fCols.includes('cve_id')) db.exec(`ALTER TABLE job_findings ADD COLUMN cve_id TEXT`);
+  if (!fCols.includes('cwe_id')) db.exec(`ALTER TABLE job_findings ADD COLUMN cwe_id TEXT`);
+  if (!fCols.includes('confidence')) db.exec(`ALTER TABLE job_findings ADD COLUMN confidence TEXT DEFAULT 'medium'`);
+  if (!fCols.includes('source_tool')) db.exec(`ALTER TABLE job_findings ADD COLUMN source_tool TEXT DEFAULT 'hermes'`);
 }
 migrate();
 
@@ -610,15 +615,18 @@ function randomToken() {
 /* Tahap 2: validasi temuan (PoC-lite)                                  */
 /* ------------------------------------------------------------------ */
 
-const VAL_STATUSES = ['confirmed', 'refuted', 'inconclusive'];
+const VAL_STATUSES = ['candidate', 'evidence-backed', 'confirmed', 'refuted', 'inconclusive'];
 const MAX_VALIDATED = 25;
 
 function normalizeValStatus(raw) {
   const aliases = {
+    candidate: 'candidate', kandidat: 'candidate',
+    'evidence-backed': 'evidence-backed', 'evidence_backed': 'evidence-backed',
+    evidencebacked: 'evidence-backed', 'terbukti-kode': 'evidence-backed',
     confirmed: 'confirmed', confirm: 'confirmed', valid: 'confirmed', validated: 'confirmed',
     terkonfirmasi: 'confirmed', benar: 'confirmed',
     refuted: 'refuted', refute: 'refuted', invalid: 'refuted', false_positive: 'refuted',
-    salah: 'refuted', ditolak: 'refuted',
+    falsepositive: 'refuted', salah: 'refuted', ditolak: 'refuted',
     inconclusive: 'inconclusive', undetermined: 'inconclusive', unknown: 'inconclusive', ragu: 'inconclusive',
   };
   if (typeof raw !== 'string') return 'inconclusive';
@@ -664,12 +672,13 @@ function buildValidatorPrompt(findings, workDir, targetUrl) {
     `Di bawah ini daftar temuan dari audit tahap pertama yang harus kamu UJI ULANG SATU PER SATU dengan bukti konkret. ` +
     `${targetDesc} ` +
     `Untuk tiap temuan, tentukan status:\n` +
-    `- "confirmed": temuan TERBUKTI nyata — sertakan bukti spesifik (potongan file:baris yang dicek, atau perilaku/parameter respons aktual).\n` +
+    `- "confirmed": temuan TERBUKTI nyata didukung manifest/respons/eksekusi — sertakan bukti spesifik (respons HTTP riil atau manifest).\n` +
+    `- "evidence-backed": temuan didukung bukti kode/konfigurasi riil di repositori (file:baris yang diverifikasi langsung).\n` +
     `- "refuted": temuan TERBUKTI keliru/false positive — jelaskan kenapa (mis. file tidak ada, mitigasi sudah ada di tempat lain).\n` +
     `- "inconclusive": tidak bisa dibuktikan tanpa runtime/data tambahan — sebutkan apa yang kurang.\n` +
     `DAFTAR TEMUAN:\n${list}\n\n` +
     `WAJIB akhiri jawaban dengan blok json (dan hanya itu blok json terakhir) berisi array — satu objek per temuan:\n` +
-    '```json\n[{"id": <id temuan>, "status": "confirmed|refuted|inconclusive", "evidence": "<bukti ringkas maks 2-3 kalimat>"}]\n```\n' +
+    '```json\n[{"id": <id temuan>, "status": "confirmed|evidence-backed|refuted|inconclusive", "evidence": "<bukti ringkas maks 2-3 kalimat>"}]\n```\n' +
     `Jangan memodifikasi file repo. Non-destruktif saja.`
   );
 }
@@ -688,7 +697,7 @@ function getEligibleFindings(jobId) {
   const rows = db
     .prepare(
       `SELECT id, severity, title, description, location FROM job_findings
-       WHERE job_id = ? AND severity != 'Info'
+       WHERE job_id = ? AND severity != 'Info' AND (validation_status IS NULL OR validation_status = 'candidate')
        ORDER BY CASE severity
          WHEN 'Critical' THEN 0 WHEN 'High' THEN 1 WHEN 'Medium' THEN 2
          WHEN 'Low' THEN 3 ELSE 4 END, id
@@ -892,17 +901,419 @@ async function prepareDiffScope(workDir, base, repoUrl) {
   }
 }
 
+/* ------------------------------------------------------------------ */
+/* Baseline Deterministik (Trivy SCA & Passive Web Inspection)         */
+/* ------------------------------------------------------------------ */
+
+const TRIVY_SEV_MAP = {
+  CRITICAL: 'Critical',
+  HIGH: 'High',
+  MEDIUM: 'Medium',
+  LOW: 'Low',
+  UNKNOWN: 'Info',
+};
+
+function isTrivyAvailable(binPath = process.env.TRIVY_BIN || 'trivy') {
+  try {
+    const res = spawnSync(binPath, ['--version'], {
+      encoding: 'utf-8',
+      timeout: 3000,
+      stdio: 'pipe',
+    });
+    return res.status === 0;
+  } catch {
+    return false;
+  }
+}
+
+function parseTrivyOutput(rawInput) {
+  let report;
+  if (typeof rawInput === 'string') {
+    if (!rawInput.trim()) return [];
+    try {
+      report = JSON.parse(rawInput);
+    } catch {
+      return [];
+    }
+  } else {
+    report = rawInput;
+  }
+
+  if (!report || !Array.isArray(report.Results)) return [];
+
+  const findings = [];
+  for (const res of report.Results) {
+    const target = res.Target || 'repository';
+
+    // 1. Vulnerabilities
+    if (Array.isArray(res.Vulnerabilities)) {
+      for (const v of res.Vulnerabilities) {
+        const cve = v.VulnerabilityID;
+        const cwe = Array.isArray(v.CweIDs) && v.CweIDs.length > 0 ? v.CweIDs.join(', ') : 'CWE-937';
+        const sev = TRIVY_SEV_MAP[String(v.Severity).toUpperCase()] || 'Medium';
+        const fix = v.FixedVersion ? `ke versi ${v.FixedVersion}` : 'ke rilis terbaru yang aman';
+
+        findings.push({
+          skill: 'dependency-scanning',
+          source_tool: 'trivy',
+          severity: sev,
+          confidence: 'high',
+          validation_status: 'confirmed',
+          cve_id: cve,
+          cwe_id: cwe,
+          title: `${v.PkgName}@${v.InstalledVersion} — ${cve}${v.Title ? `: ${v.Title}` : ''}`,
+          description: v.Description || `Kerentanan teridentifikasi pada paket dependensi ${v.PkgName}. Referensi: ${v.PrimaryURL || cve}`,
+          location: `${target}:${v.PkgName}@${v.InstalledVersion}`,
+          recommendation: `Upgrade dependensi ${v.PkgName} ${fix}.`,
+          validation_evidence: `Manifes ${target} memuat paket rentan ${v.PkgName}@${v.InstalledVersion} (ID: ${cve}). Terdeteksi secara deterministik oleh Trivy.`,
+        });
+      }
+    }
+
+    // 2. Secrets
+    if (Array.isArray(res.Secrets)) {
+      for (const s of res.Secrets) {
+        const sev = TRIVY_SEV_MAP[String(s.Severity).toUpperCase()] || 'High';
+        const line = s.StartLine || 1;
+
+        findings.push({
+          skill: 'vulnerability-scanning',
+          source_tool: 'trivy',
+          severity: sev,
+          confidence: 'high',
+          validation_status: 'confirmed',
+          cwe_id: 'CWE-798',
+          title: `Hardcoded Secret: ${s.Title || s.RuleID}`,
+          description: `Terdeteksi token/kredensial statis (${s.Category || 'Secret'}: ${s.RuleID}) di dalam berkas kode repositori.`,
+          location: `${target}:${line}`,
+          recommendation: 'Hapus nilai rahasia dari repositori git, gunakan secret manager atau environment variables, dan lakukan rotasi kredensial tersebut.',
+          validation_evidence: `Berkas ${target} baris ${line} cocok dengan pola aturan deteksi secret '${s.RuleID}'.`,
+        });
+      }
+    }
+  }
+
+  return findings;
+}
+
+function runTrivyBaseline(workDir) {
+  const bin = process.env.TRIVY_BIN || 'trivy';
+  if (!isTrivyAvailable(bin)) {
+    return { status: 'skipped', reason: 'trivy_not_installed', findings: [] };
+  }
+
+  try {
+    const res = spawnSync(bin, ['fs', workDir, '--format', 'json', '--scanners', 'vuln,secret'], {
+      encoding: 'utf-8',
+      timeout: 180_000,
+      maxBuffer: 32 * 1024 * 1024,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    if (res.error) {
+      return { status: 'failed', reason: res.error.message, findings: [] };
+    }
+
+    const stdout = res.stdout || '';
+    const findings = parseTrivyOutput(stdout);
+    return { status: 'done', findings };
+  } catch (err) {
+    return { status: 'failed', reason: err.message, findings: [] };
+  }
+}
+
+// Anti-SSRF DNS Pre-flight Check
+function isPrivateOrBlockedIp(ip) {
+  const cleanIp = String(ip).trim().toLowerCase();
+  if (cleanIp.startsWith('::ffff:')) {
+    const rest = cleanIp.slice(7);
+    if (net.isIPv4(rest)) return isPrivateOrBlockedIp(rest);
+  }
+
+  const family = net.isIP(cleanIp);
+  if (family === 4) {
+    const parts = cleanIp.split('.').map((p) => Number.parseInt(p, 10));
+    if (parts.length !== 4 || parts.some((p) => Number.isNaN(p) || p < 0 || p > 255)) {
+      return { blocked: true, reason: 'invalid_ipv4_format' };
+    }
+    const [a, b] = parts;
+    if (a === 127) return { blocked: true, reason: 'loopback_ipv4' };
+    if (a === 10) return { blocked: true, reason: 'private_rfc1918_10' };
+    if (a === 172 && b >= 16 && b <= 31) return { blocked: true, reason: 'private_rfc1918_172' };
+    if (a === 192 && b === 168) return { blocked: true, reason: 'private_rfc1918_192' };
+    if (a === 169 && b === 254) return { blocked: true, reason: 'link_local_169_254' };
+    if (a === 100 && b >= 64 && b <= 127) return { blocked: true, reason: 'cgnat_rfc6598' };
+    if (a === 0) return { blocked: true, reason: 'unspecified_zero_ipv4' };
+    if (cleanIp === '255.255.255.255') return { blocked: true, reason: 'broadcast_ipv4' };
+    if (a === 192 && b === 0 && parts[2] === 2) return { blocked: true, reason: 'documentation_ipv4' };
+    if (a === 198 && b === 51 && parts[2] === 100) return { blocked: true, reason: 'documentation_ipv4' };
+    if (a === 203 && b === 0 && parts[2] === 113) return { blocked: true, reason: 'documentation_ipv4' };
+    if (a >= 224) return { blocked: true, reason: 'multicast_or_reserved_ipv4' };
+    return { blocked: false };
+  }
+
+  if (family === 6) {
+    if (cleanIp === '::1') return { blocked: true, reason: 'loopback_ipv6' };
+    if (cleanIp === '::' || cleanIp === '0:0:0:0:0:0:0:0') return { blocked: true, reason: 'unspecified_ipv6' };
+    if (cleanIp.startsWith('fc') || cleanIp.startsWith('fd')) return { blocked: true, reason: 'unique_local_ipv6' };
+    if (/^fe[89ab]/i.test(cleanIp)) return { blocked: true, reason: 'link_local_ipv6' };
+    if (cleanIp.startsWith('ff')) return { blocked: true, reason: 'multicast_ipv6' };
+    if (cleanIp.startsWith('2001:db8:') || cleanIp.startsWith('2001:0db8:')) return { blocked: true, reason: 'documentation_ipv6' };
+    return { blocked: false };
+  }
+
+  return { blocked: true, reason: 'not_an_ip' };
+}
+
+async function checkSafeDns(hostname) {
+  const cleanHost = String(hostname).trim().toLowerCase();
+  if (net.isIP(cleanHost)) {
+    const check = isPrivateOrBlockedIp(cleanHost);
+    return check.blocked
+      ? { ok: false, error: 'blocked_ip', reason: check.reason, addresses: [cleanHost] }
+      : { ok: true, addresses: [cleanHost] };
+  }
+
+  try {
+    const resolved = await dns.lookup(cleanHost, { all: true });
+    if (!resolved || resolved.length === 0) {
+      return { ok: false, error: 'dns_resolution_failed', reason: 'no_addresses' };
+    }
+    const addresses = resolved.map((r) => r.address);
+    for (const addr of addresses) {
+      const check = isPrivateOrBlockedIp(addr);
+      if (check.blocked) {
+        return { ok: false, error: 'blocked_ip', reason: `Resolved IP ${addr} is prohibited: ${check.reason}`, addresses };
+      }
+    }
+    return { ok: true, addresses };
+  } catch (err) {
+    return { ok: false, error: 'dns_resolution_failed', reason: err.message };
+  }
+}
+
+function inspectHttpHeaders(input) {
+  const findings = [];
+  const { url, statusCode, headers } = input;
+  let parsedUrl;
+  try {
+    parsedUrl = new URL(url);
+  } catch {
+    return findings;
+  }
+
+  const isHttps = parsedUrl.protocol === 'https:';
+  const h = {};
+  for (const [k, v] of Object.entries(headers || {})) {
+    if (v === undefined || v === null) continue;
+    h[k.toLowerCase()] = Array.isArray(v) ? v.join(', ') : String(v);
+  }
+
+  if (isHttps) {
+    const hsts = h['strict-transport-security'];
+    if (!hsts) {
+      findings.push({
+        skill: 'passive-web',
+        source_tool: 'passive-web',
+        severity: 'Medium',
+        confidence: 'high',
+        validation_status: 'confirmed',
+        cwe_id: 'CWE-319',
+        title: 'Missing Strict-Transport-Security (HSTS) Header',
+        description: 'Aplikasi HTTPS tidak mengirimkan header Strict-Transport-Security. Hal ini memungkinkan pengguna menjadi rentan terhadap serangan SSL stripping atau downgrade ke HTTP.',
+        location: `${parsedUrl.origin}/ (HTTP ${statusCode})`,
+        recommendation: 'Tambahkan header HTTP: Strict-Transport-Security: max-age=31536000; includeSubDomains; preload',
+        validation_evidence: `Respons HTTP ${statusCode} dari ${parsedUrl.origin}/ tidak memuat header 'Strict-Transport-Security'.`,
+      });
+    } else {
+      const maxAgeMatch = hsts.match(/max-age\s*=\s*(\d+)/i);
+      const maxAge = maxAgeMatch ? Number.parseInt(maxAgeMatch[1], 10) : 0;
+      if (maxAge < 15724800) {
+        findings.push({
+          skill: 'passive-web',
+          source_tool: 'passive-web',
+          severity: 'Low',
+          confidence: 'high',
+          validation_status: 'confirmed',
+          cwe_id: 'CWE-319',
+          title: 'HSTS Duration Terlalu Pendek',
+          description: `Durasi HSTS max-age terdeteksi hanya ${maxAge} detik (kurang dari 15.724.800 detik / 6 bulan).`,
+          location: `${parsedUrl.origin}/`,
+          recommendation: 'Tingkatkan nilai max-age HSTS menjadi minimal 31536000 (1 tahun).',
+          validation_evidence: `Header Strict-Transport-Security: '${hsts}'`,
+        });
+      }
+    }
+  }
+
+  const csp = h['content-security-policy'];
+  if (!csp) {
+    findings.push({
+      skill: 'passive-web',
+      source_tool: 'passive-web',
+      severity: 'Medium',
+      confidence: 'high',
+      validation_status: 'confirmed',
+      cwe_id: 'CWE-1021',
+      title: 'Missing Content-Security-Policy (CSP) Header',
+      description: 'Aplikasi tidak mengonfigurasikan header Content-Security-Policy. Ketiadaan CSP meningkatkan risiko eksploitasi Cross-Site Scripting (XSS) dan pemuatan resource berbahaya.',
+      location: `${parsedUrl.origin}/ (HTTP ${statusCode})`,
+      recommendation: 'Terapkan header Content-Security-Policy yang membatasi sumber script, style, dan koneksi eksternal.',
+      validation_evidence: `Respons HTTP ${statusCode} dari ${parsedUrl.origin}/ tidak memuat header 'Content-Security-Policy'.`,
+    });
+  }
+
+  const xfo = h['x-frame-options'];
+  const hasFrameAncestors = csp && /frame-ancestors/i.test(csp);
+  if (!xfo && !hasFrameAncestors) {
+    findings.push({
+      skill: 'passive-web',
+      source_tool: 'passive-web',
+      severity: 'Low',
+      confidence: 'high',
+      validation_status: 'confirmed',
+      cwe_id: 'CWE-1021',
+      title: 'Missing X-Frame-Options Header (Clickjacking Risk)',
+      description: 'Aplikasi dapat di-embed ke dalam iframe di domain lain tanpa pembatasan frame-ancestors atau X-Frame-Options, menimbulkan risiko serangan clickjacking.',
+      location: `${parsedUrl.origin}/`,
+      recommendation: 'Tambahkan header X-Frame-Options: DENY atau SAMEORIGIN, atau gunakan CSP frame-ancestors.',
+      validation_evidence: `Respons HTTP ${statusCode} tidak memuat 'X-Frame-Options' maupun CSP 'frame-ancestors'.`,
+    });
+  }
+
+  const xcto = h['x-content-type-options'];
+  if (!xcto || !xcto.toLowerCase().includes('nosniff')) {
+    findings.push({
+      skill: 'passive-web',
+      source_tool: 'passive-web',
+      severity: 'Low',
+      confidence: 'high',
+      validation_status: 'confirmed',
+      cwe_id: 'CWE-116',
+      title: 'Missing or Incomplete X-Content-Type-Options Header',
+      description: 'Browser dapat mencoba menebak (MIME-sniffing) tipe konten file, yang berpotensi mengeksekusi file non-script sebagai JavaScript.',
+      location: `${parsedUrl.origin}/`,
+      recommendation: 'Tambahkan header: X-Content-Type-Options: nosniff',
+      validation_evidence: `Header X-Content-Type-Options bernilai: '${xcto || 'tidak ada'}'`,
+    });
+  }
+
+  const rp = h['referrer-policy'];
+  if (!rp) {
+    findings.push({
+      skill: 'passive-web',
+      source_tool: 'passive-web',
+      severity: 'Low',
+      confidence: 'high',
+      validation_status: 'confirmed',
+      cwe_id: 'CWE-200',
+      title: 'Missing Referrer-Policy Header',
+      description: 'Aplikasi tidak mengontrol pengiriman informasi Referer pada navigasi lintas situs.',
+      location: `${parsedUrl.origin}/`,
+      recommendation: 'Tambahkan header: Referrer-Policy: strict-origin-when-cross-origin',
+      validation_evidence: `Respons HTTP ${statusCode} tidak memuat header 'Referrer-Policy'.`,
+    });
+  }
+
+  const server = h['server'];
+  const xPoweredBy = h['x-powered-by'];
+  const bannerLeak = [
+    server && /\d+\.\d+/.test(server) ? `Server: ${server}` : null,
+    xPoweredBy ? `X-Powered-By: ${xPoweredBy}` : null,
+  ].filter(Boolean).join('; ');
+
+  if (bannerLeak) {
+    findings.push({
+      skill: 'passive-web',
+      source_tool: 'passive-web',
+      severity: 'Low',
+      confidence: 'high',
+      validation_status: 'confirmed',
+      cwe_id: 'CWE-200',
+      title: 'Technology & Version Information Disclosure',
+      description: `Aplikasi membocorkan versi teknologi backend melalui respon header (${bannerLeak}), memudahkan penyerang memetakan kerentanan spesifik versi.`,
+      location: `${parsedUrl.origin}/`,
+      recommendation: 'Sembunyikan atau samarkan header Server dan hapus header X-Powered-By pada konfigurasi server/framework.',
+      validation_evidence: `Header respon membocorkan: ${bannerLeak}`,
+    });
+  }
+
+  return findings;
+}
+
+async function runPassiveWebBaseline(targetUrl) {
+  let parsed;
+  try {
+    parsed = new URL(targetUrl);
+  } catch {
+    return { status: 'skipped', reason: 'invalid_url', findings: [] };
+  }
+
+  const dnsRes = await checkSafeDns(parsed.hostname);
+  if (!dnsRes.ok) {
+    return { status: 'skipped', reason: `anti_ssrf_blocked: ${dnsRes.reason}`, findings: [] };
+  }
+
+  try {
+    const res = await fetch(parsed.toString(), {
+      method: 'GET',
+      headers: {
+        'User-Agent': 'SecScan-Hub-Auditor/1.0 (Authorized Security Baseline Check)',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      },
+      signal: AbortSignal.timeout(10_000),
+      redirect: 'manual',
+    });
+
+    const headersRecord = {};
+    res.headers.forEach((value, key) => {
+      headersRecord[key.toLowerCase()] = value;
+    });
+
+    const findings = inspectHttpHeaders({
+      url: targetUrl,
+      statusCode: res.status,
+      headers: headersRecord,
+    });
+
+    return { status: 'done', findings };
+  } catch (err) {
+    return { status: 'failed', reason: err.message, findings: [] };
+  }
+}
+
 /** Simpan temuan hasil parse ke job_findings + update severity_counts job. */
 function persistFindings(jobId, skill, parsed) {
-  if (!parsed.length) return;
+  if (!parsed || !parsed.length) return;
   const stmt = db.prepare(
-    `INSERT INTO job_findings (job_id, skill, severity, title, description, location, recommendation, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    `INSERT INTO job_findings (
+      job_id, skill, severity, title, description, location, recommendation,
+      validation_status, validation_evidence, cve_id, cwe_id, confidence, source_tool, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   );
   const now = Date.now();
   const tx = db.transaction((rows) => {
     for (const f of rows) {
-      stmt.run(jobId, skill, f.severity, f.title, f.description ?? null, f.location ?? null, f.recommendation ?? null, now);
+      const srcTool = f.source_tool || (skill === 'trivy' ? 'trivy' : skill === 'passive-web' ? 'passive-web' : 'hermes');
+      const isDet = srcTool === 'trivy' || srcTool === 'passive-web';
+      const valStatus = f.validation_status || (isDet ? 'confirmed' : 'candidate');
+      const conf = f.confidence || (isDet ? 'high' : 'medium');
+      stmt.run(
+        jobId,
+        skill,
+        f.severity,
+        f.title,
+        f.description ?? null,
+        f.location ?? null,
+        f.recommendation ?? null,
+        valStatus,
+        f.validation_evidence ?? null,
+        f.cve_id ?? null,
+        f.cwe_id ?? null,
+        conf,
+        srcTool,
+        now
+      );
     }
   });
   tx(parsed);
@@ -931,23 +1342,50 @@ function buildReport(job, skillResults, finalStatus, allFindings, validationInfo
   lines.push('---');
   lines.push('');
 
-  // Ringkasan eksekutif — temuan terurut severity, dengan status validasi.
+  // Ringkasan eksekutif — temuan terurut severity, dengan pemisahan deterministik vs AI.
   if (totalFindings > 0) {
     lines.push('# Ringkasan Temuan');
     lines.push('');
     lines.push(`Total **${totalFindings}** temuan — **${counts.Critical}** Critical, **${counts.High}** High, **${counts.Medium}** Medium, **${counts.Low}** Low, **${counts.Info}** Info.`);
     lines.push('');
-    lines.push('| # | Severity | Judul | Skill | Lokasi | Validasi |');
-    lines.push('|---|---|---|---|---|---|');
+
     const order = { Critical: 0, High: 1, Medium: 2, Low: 3, Info: 4 };
-    const sorted = [...allFindings].sort((a, b) => (order[a.severity] ?? 9) - (order[b.severity] ?? 9));
-    const valMap = new Map((validationInfo?.validatedRows ?? []).map((r) => [r.id, r]));
-    sorted.forEach((f, i) => {
-      const esc = (s) => String(s ?? '').replace(/\|/g, '\\|').replace(/\r?\n/g, ' ');
-      const val = validationInfo?.validatedRows ? (valMap.get(f.id)?.status ?? '—') : '';
-      lines.push(`| ${i + 1} | **${f.severity}** | ${esc(f.title)} | ${esc(f.skill)} | ${esc(f.location) ?? '—'} | ${val} |`);
-    });
-    lines.push('');
+    const esc = (s) => String(s ?? '').replace(/\|/g, '\\|').replace(/\r?\n/g, ' ');
+
+    const detFindings = allFindings.filter((f) => f.source_tool === 'trivy' || f.source_tool === 'passive-web');
+    const aiFindings = allFindings.filter((f) => f.source_tool !== 'trivy' && f.source_tool !== 'passive-web');
+
+    if (detFindings.length > 0) {
+      lines.push('## Hasil Pemindaian Deterministik (Trivy & Web Baseline)');
+      lines.push('');
+      lines.push(`Ditemukan **${detFindings.length}** temuan berbasis bukti deterministik langsung.`);
+      lines.push('');
+      lines.push('| # | Severity | Judul | Alat | CVE / CWE | Lokasi / Bukti |');
+      lines.push('|---|---|---|---|---|---|');
+      const detSorted = [...detFindings].sort((a, b) => (order[a.severity] ?? 9) - (order[b.severity] ?? 9));
+      detSorted.forEach((f, i) => {
+        const ref = [f.cve_id, f.cwe_id].filter(Boolean).join(' / ') || '—';
+        const loc = f.location || f.validation_evidence || '—';
+        lines.push(`| ${i + 1} | **${f.severity}** | ${esc(f.title)} | \`${esc(f.source_tool || f.skill)}\` | ${esc(ref)} | ${esc(loc)} |`);
+      });
+      lines.push('');
+    }
+
+    if (aiFindings.length > 0) {
+      lines.push('## Analisis Keamanan Berbasis AI (Hermes Skills)');
+      lines.push('');
+      lines.push(`Ditemukan **${aiFindings.length}** temuan kontekstual dari evaluasi kelemahan logika dan arsitektur kode.`);
+      lines.push('');
+      lines.push('| # | Severity | Judul | Skill | Lokasi | Validasi |');
+      lines.push('|---|---|---|---|---|---|');
+      const aiSorted = [...aiFindings].sort((a, b) => (order[a.severity] ?? 9) - (order[b.severity] ?? 9));
+      const valMap = new Map((validationInfo?.validatedRows ?? []).map((r) => [r.id, r]));
+      aiSorted.forEach((f, i) => {
+        const val = validationInfo?.validatedRows ? (valMap.get(f.id)?.status ?? f.validation_status ?? 'candidate') : (f.validation_status ?? '—');
+        lines.push(`| ${i + 1} | **${f.severity}** | ${esc(f.title)} | ${esc(f.skill)} | ${esc(f.location) ?? '—'} | ${val} |`);
+      });
+      lines.push('');
+    }
   }
 
   // Ringkasan validasi (tahap PoC) bila dijalankan.
@@ -1122,6 +1560,37 @@ async function processJob(bullJob) {
     }
   }
 
+  // ——— Tahap 1: Baseline Deterministik (Trivy SCA / Passive Web) ———
+  if (job.target_type === 'github') {
+    console.log(`[worker] job ${jobId} — menjalankan baseline deterministik: Trivy SCA & Secrets`);
+    try {
+      const trivyRes = runTrivyBaseline(workDir);
+      if (trivyRes.status === 'done' && trivyRes.findings.length > 0) {
+        persistFindings(jobId, 'trivy', trivyRes.findings);
+        for (const f of trivyRes.findings) allFindings.push({ ...f, skill: 'trivy' });
+        console.log(`[worker] job ${jobId} — Trivy menemukan ${trivyRes.findings.length} temuan deterministik`);
+      } else if (trivyRes.status === 'skipped') {
+        console.log(`[worker] job ${jobId} — Trivy dilewati: ${trivyRes.reason}`);
+      }
+    } catch (err) {
+      console.warn(`[worker] job ${jobId} — eksekusi Trivy baseline error (non-fatal):`, err?.message ?? err);
+    }
+  } else if (job.target_type === 'url' && targetUrl) {
+    console.log(`[worker] job ${jobId} — menjalankan baseline deterministik: Passive Web Inspection`);
+    try {
+      const webRes = await runPassiveWebBaseline(targetUrl);
+      if (webRes.status === 'done' && webRes.findings.length > 0) {
+        persistFindings(jobId, 'passive-web', webRes.findings);
+        for (const f of webRes.findings) allFindings.push({ ...f, skill: 'passive-web' });
+        console.log(`[worker] job ${jobId} — Passive Web menemukan ${webRes.findings.length} temuan deterministik`);
+      } else if (webRes.status === 'skipped') {
+        console.log(`[worker] job ${jobId} — Passive Web dilewati: ${webRes.reason}`);
+      }
+    } catch (err) {
+      console.warn(`[worker] job ${jobId} — eksekusi Passive Web baseline error (non-fatal):`, err?.message ?? err);
+    }
+  }
+
   for (let i = 0; i < total; i++) {
     const skill = skills[i];
     console.log(`[worker] job ${jobId} — skill ${i + 1}/${total}: ${skill} (running)`);
@@ -1145,8 +1614,14 @@ async function processJob(bullJob) {
     if (result.status === 'done') {
       try {
         const parsed = parseFindings(result.output);
-        persistFindings(jobId, skill, parsed);
-        for (const f of parsed) allFindings.push({ ...f, skill });
+        const mapped = parsed.map((f) => ({
+          ...f,
+          source_tool: 'hermes',
+          confidence: 'medium',
+          validation_status: 'candidate',
+        }));
+        persistFindings(jobId, skill, mapped);
+        for (const f of mapped) allFindings.push({ ...f, skill });
         if (parsed.length > 0) {
           console.log(`[worker] job ${jobId} — ${parsed.length} temuan diparse dari ${skill}`);
         }
@@ -1189,7 +1664,7 @@ async function processJob(bullJob) {
             const nConf = items.filter((i) => i.status === 'confirmed').length;
             const nRef = items.filter((i) => i.status === 'refuted').length;
             console.log(`[worker] job ${jobId} — validasi selesai: ${items.length} diproses (${nConf} confirmed, ${nRef} refuted)`);
-            validationInfo = { status: 'done', validated: items.length, confirmed: nConf, refuted: nRef, output: valResult.output };
+            validationInfo = { status: 'done', validated: items.length, confirmed: nConf, refuted: nRef, output: valResult.output, validatedRows: items };
           } catch (err) {
             console.error(`[worker] job ${jobId} — gagal apply validation:`, err?.message ?? err);
             validationInfo = { status: 'failed', reason: err?.message ?? 'apply_error', validated: 0 };

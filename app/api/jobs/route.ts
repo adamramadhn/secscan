@@ -1,7 +1,7 @@
 import { NextResponse } from 'next/server';
 import { withAuth } from '@/lib/require-auth';
 import { cloneRepo, isValidGithubUrl, isValidDiffBase } from '@/lib/clone';
-import { isValidLiveUrl } from '@/lib/target';
+import { isValidLiveUrl, validateLiveUrlWithDns } from '@/lib/target';
 import { enqueueScan } from '@/lib/jobs';
 import { getSkill } from '@/lib/skills';
 import { createJob, listJobs, updateJob, addAudit } from '@/lib/db';
@@ -82,9 +82,9 @@ export const POST = withAuth(async (req: Request) => {
   if (targetType === 'url') {
     // ——— Target URL live (black-box) ———
     const raw = typeof body.repoUrl === 'string' ? body.repoUrl.trim() : '';
-    const valid = isValidLiveUrl(raw);
+    const valid = await validateLiveUrlWithDns(raw);
     if (!valid.ok) {
-      return NextResponse.json({ error: 'invalid_target_url', detail: valid.error }, { status: 400 });
+      return NextResponse.json({ error: 'invalid_target_url', detail: valid.error, reason: valid.detail }, { status: 400 });
     }
 
     // Skill repo-only (SAST dsb.) tidak berlaku untuk URL live.

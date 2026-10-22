@@ -51,6 +51,7 @@ Sysadmin memberi nilai via `EnvironmentFile` systemd; worker punya fallback `.en
 | `HOSTNAME` | web | `127.0.0.1` | jangan `0.0.0.0` di VPS publik — expose lewat nginx |
 | `HERMES_BIN` | worker | `hermes` | path absolut bila hermes tidak ada di PATH unit |
 | `HERMES_PATH` | worker | — | prefix tambahan PATH saat spawn hermes |
+| `TRIVY_BIN` | worker | `trivy` | path ke binary Trivy bila tidak ada di PATH standar; fallback otomatis bila tidak terpasang |
 | `WORKER_CONCURRENCY` | worker | `2` | clamp 1–5; tiap skill = satu proses Hermes utuh, naikkan bertahap |
 
 Sebagai referensi deployment prod yang pernah dipakai: app built standalone di `/opt/secscan/app` (dipakai custom `server.js` hasil `next build`), worker di `/opt/secscan/worker.js` — tapi `next start` polos dari repo pun cukup.
@@ -149,6 +150,11 @@ npm run worker &     # worker BullMQ (butuh redis + dsb)
 npx tsx tests/smoke-db.ts          # smoke db
 npx tsx tests/smoke-target.ts      # validasi target
 npx tsx tests/smoke-validation.ts  # validasi URL SSRF
+npx tsx tests/smoke-dns-check.ts   # anti-SSRF & resolusi DNS
+npx tsx tests/smoke-cwe-compliance.ts # taksonomi CWE & OWASP Top 10
+npx tsx tests/smoke-web-check.ts   # baseline header HTTP pasif
+npx tsx tests/smoke-trivy.ts       # parser Trivy SCA & Secrets
+npx tsx tests/smoke-schedule-consent.ts # otorisasi target pada jadwal
 npx tsx tests/smoke-knowledge.ts   # learning temuan
 npx tsx tests/smoke-findings.ts
 npx tsx tests/smoke-fixes.ts
@@ -173,3 +179,17 @@ Semua smoke test di atas tidak butuh Hermes; tidak ada test terpadu untuk worker
 3. Output skill dipotong 200 KB (OUTPUT_LIMIT) — jangan berharap menerima log panjang penuh.
 4. Rate limit login disimpan in-memory per proses web — restart web menghapus throttling.
 5. Jangan `pkill -f next-server` di VPS yang juga menjalankan bot gateway Hermes (kill generik bisa memotong proses lain). Gunakan unit spesifik: `systemctl stop secscan`.
+
+## Agent skills
+
+### Issue tracker
+
+Issue dan spesifikasi dilacak di GitHub Issues (`adamramadhn/secscan`). Lihat `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Gunakan label default: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, dan `wontfix`. Lihat `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Layout single-context: `GLOSSARY.md` di root dan ADR di `docs/adr/`. Lihat `docs/agents/domain.md`.

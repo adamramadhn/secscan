@@ -56,7 +56,7 @@ export interface JobSkill {
 
 export type Severity = 'Critical' | 'High' | 'Medium' | 'Low' | 'Info';
 
-export type ValidationStatus = 'confirmed' | 'refuted' | 'inconclusive';
+export type ValidationStatus = 'candidate' | 'evidence-backed' | 'confirmed' | 'refuted' | 'inconclusive';
 
 export interface Finding {
   id: number;
@@ -70,6 +70,10 @@ export interface Finding {
   validation_status: ValidationStatus | null;
   validation_evidence: string | null;
   seen_count?: number;
+  cve_id?: string | null;
+  cwe_id?: string | null;
+  confidence?: string | null;
+  source_tool?: string | null;
   created_at: number;
 }
 
@@ -209,6 +213,7 @@ export interface CreateScheduleBody {
   autoFix?: boolean;
   diffBase?: string;
   intervalMinutes: number;
+  confirmOfensif?: boolean;
 }
 
 /** GET /api/schedules → { schedules } */
