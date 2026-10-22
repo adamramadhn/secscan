@@ -1,10 +1,10 @@
 # SecurityScan Hub — Design Spec
 
-> Dibuat: 2026-08-23. Status: Approved oleh user. Path: /root/secscan-archived/.
+> Dibuat: 2026-08-23. Status: Approved oleh user. Path: <repo-root>/.
 
 ## 1. Ringkasan
 
-Web app "secscan.dams.my.id" di vps2 (43.159.47.123) untuk menjalankan skill-skill security/DevOps Hermes terhadap target repo, dengan UI interaktif, progress live, dan report markdown yang bisa di-download.
+Web app self-hosted di sebuah VPS untuk menjalankan skill-skill security/DevOps Hermes terhadap target repo, dengan UI interaktif, progress live, dan report markdown yang bisa di-download.
 
 ## 2. Keputusan yang sudah disetujui user
 
@@ -12,10 +12,10 @@ Web app "secscan.dams.my.id" di vps2 (43.159.47.123) untuk menjalankan skill-ski
 |---|---|
 | Eksekusi | Hermes headless selalu (`hermes -z ... -s <skill> --in <repo> --safe-mode`) |
 | Stack | Next.js + API route + auth sederhana |
-| Auth | Session cookie + bcrypt password (`CakraVistaA1`) |
+| Auth | Session cookie + bcrypt password (pilihan deployer) |
 | Target | GitHub repo (clone) — utama; upload zip & path lokal sebagai bonus |
 | Queue | BullMQ + Redis — worker terpisah, progress tidak hilang jika tab ditutup/refresh |
-| Deploy | /opt/secscan + systemd (app + worker) + nginx SSL + subdomain secscan.dams.my.id |
+| Deploy | /opt/secscan + systemd (app + worker) + nginx SSL + subdomain via DNS A record |
 | UI | Interaktif dark; pakai referensi skill `ui-styling`/`design-system`/`ui-ux-pro-max` |
 
 ## 3. Arsitektur
@@ -101,11 +101,11 @@ GET  /api/jobs/:id/artifacts/:file -> download artifact
 
 - `apt install redis-server` (bind 127.0.0.1, protected-mode). REDIS_URL=redis://127.0.0.1:6379/5
 - `/opt/secscan/` + `secscan.env` (AUTH_PASSWORD_HASH=bcrypt, SESSION_SECRET, REDIS_URL, ...)
-- Docker? Tidak — pola **non-Docker Next.js** skill `nextjs-deployment` (build → systemd → nginx) lebih ringan & sudah terbukti di dash.
+- Docker? Tidak — pola **non-Docker Next.js** skill `nextjs-deployment` (build → systemd → nginx) lebih ringan & cukup untuk kebutuhan ini.
   - Build: `/opt/secscan` production build (`next build`)
   - `secscan.service` → `next start -p 3011` ; `secscan-worker.service` → `node worker.js`
-- nginx `secscan.dams.my.id` (Let's Encrypt, pola yang sama dengan dash) → 127.0.0.1:3011
-- Akses: https://secscan.dams.my.id (login password). Cloudflare optional (DNS proxied).
+- nginx `<subdomain-scan>` (Let's Encrypt) → 127.0.0.1:3011
+- Akses: https://<subdomain-scan> (login password). Cloudflare optional (DNS proxied).
 - Rollback: stop service baru, nginx balik ke port lama (tidak ada app lama — rollback = hapus service + nginx site).
 
 ## 8. Keamanan

@@ -2,24 +2,24 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build "secscan.dams.my.id" — a Next.js web app on vps2 that runs selected Hermes security skills against a GitHub repo, with live progress (BullMQ+Redis) and downloadable markdown reports.
+**Goal:** Build a self-hosted security-scan hub — a Next.js web app on a VPS that runs selected Hermes security skills against a GitHub repo, with live progress (BullMQ+Redis) and downloadable markdown reports.
 
 **Architecture:** Next.js 15 (App Router, API routes) + SQLite (better-sqlite3) as source of truth + BullMQ over local Redis for the job queue + a standalone worker process that spawns `hermes -z ... -s <skill> --in <repo> --safe-mode` per skill, persisting per-skill status to SQLite and streaming live progress via SSE. Deployed non-Docker via systemd (app on 127.0.0.1:3011, worker separate unit) behind nginx + Let's Encrypt.
 
-**Tech Stack:** Node 22 (vps2), Next.js 15, React 19, Tailwind CSS v3, better-sqlite3, bullmq, ioredis, bcryptjs, next-themes. Deploy: systemd + nginx.
+**Tech Stack:** Node 22, Next.js 15, React 19, Tailwind CSS v3, better-sqlite3, bullmq, ioredis, bcryptjs, next-themes. Deploy: systemd + nginx.
 
-**Spec:** `/root/secscan-archived/docs/spec-design.md` (approved 2026-08-23).
+**Spec:** `<repo-root>/docs/spec-design.md` (approved 2026-08-23).
 
 ## Global Constraints
 
-- Target rilis: prod di vps2, port 3011, bind 127.0.0.1. Subdomain `secscan.dams.my.id`.
+- Target rilis: prod di server, port 3011, bind 127.0.0.1. Subdomain via DNS A record.
 - Hermes engine: `hermes -z "<task>" -s <skill> --in <workdir> --safe-mode` (JANGAN --yolo; --safe-mode wajib).
-- Repo source of truth: `/root/secscan-archived` (git init + commit tiap task).
+- Repo source of truth: `<repo-root>` (git init + commit tiap task).
 - JANGAN `pkill -f next-server` (memutus gateway Hermes). Kill app spesifik via `ss -tlnp | grep :3011`.
 - Env prod di `/opt/secscan/secscan.env` (tidak di-commit). Dev pakai `.env.local`.
 - Skill ofensif (🔴: penetration-testing, dast-scanning, ai-red-teaming) WAJIB konfirmasi eksplisit di UI sebelum spawn.
 - Semua path kerja scan: `/var/lib/secscan/work/<jobId>/` (clone), reports: `/var/lib/secscan/reports/<jobId>/`.
-- Password login: `CakraVistaA1` (bcrypt hash di env AUTH_PASSWORD_HASH).
+- Password login: ditentukan deployer (bcrypt hash di env AUTH_PASSWORD_HASH).
 - BullMQ Redis: `redis://127.0.0.1:6379/5`. Worker concurrency 1.
 - UI: dark theme ala Linear, referensi skill ui-styling/design-system/ui-ux-pro-max.
 
@@ -28,7 +28,7 @@
 ### Task 1: Scaffold + dependensi + konfigurasi dasar
 
 **Files:**
-- Create: `/root/secscan-archived/package.json`, `next.config.mjs`, `tsconfig.json`, `tailwind.config.ts`, `postcss.config.mjs`, `.gitignore`, `.env.local` (dev), `app/layout.tsx`, `app/globals.css`, `app/page.tsx` (placeholder), `lib/` (kosong sementara)
+- Create: `<repo-root>/package.json`, `next.config.mjs`, `tsconfig.json`, `tailwind.config.ts`, `postcss.config.mjs`, `.gitignore`, `.env.local` (dev), `app/layout.tsx`, `app/globals.css`, `app/page.tsx` (placeholder), `lib/` (kosong sementara)
 - Test: `curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:3011`
 
 **Interfaces:**
@@ -51,7 +51,7 @@
 }
 ```
 
-- [ ] **Step 2: Install** — `cd /root/secscan-archived && npm install`
+- [ ] **Step 2: Install** — `cd <repo-root> && npm install`
 
 - [ ] **Step 3: next.config.mjs + tsconfig + tailwind + postcss + .gitignore + .env.local**
 
@@ -119,7 +119,7 @@ Schema persis di spec §4. Path DB: env `DB_PATH` default `/var/lib/secscan/secs
 - [ ] **Step 1: auth.ts** — createSession/validate/destroy + rateLimit (Map keyed IP)
 - [ ] **Step 2: login route** — verify, set cookie; rate-limit 429
 - [ ] **Step 3: logout route** — destroy session + clear cookie
-- [ ] **Step 4: Tes curl** — `curl -c /tmp/cj -X POST http://127.0.0.1:3011/api/login -H 'Content-Type: application/json' -d '{"password":"CakraVistaA1"}'` → 200 + cookie; salah → 401; setelah 5x salah → 429
+- [ ] **Step 4: Tes curl** — `curl -c /tmp/cj -X POST http://127.0.0.1:3011/api/login -H 'Content-Type: application/json' -d "{"password":"<password>"}"` → 200 + cookie; salah → 401; setelah 5x salah → 429
 - [ ] **Step 5: Commit** — `feat: auth session cookie`
 
 ### Task 4: Skill catalog API + auth guard helper
@@ -223,22 +223,22 @@ Schema persis di spec §4. Path DB: env `DB_PATH` default `/var/lib/secscan/secs
 ### Task 10: Redis + systemd + nginx + deploy prod
 
 **Files:**
-- Modify (ops): `/etc/nginx/sites-available/secscan.dams.my.id`, `/etc/systemd/system/secscan.service`, `secscan-worker.service`, `/opt/secscan/secscan.env`
-- Test: `curl -I https://secscan.dams.my.id` → 200/302; `systemctl status secscan` active; job end-to-end via https
+- Modify (ops): `/etc/nginx/sites-available/<subdomain-scan>`, `/etc/systemd/system/secscan.service`, `secscan-worker.service`, `/opt/secscan/secscan.env`
+- Test: `curl -I https://<subdomain-scan>` → 200/302; `systemctl status secscan` active; job end-to-end via https
 
 **Interfaces:**
 - Redis: `apt install -y redis-server`; bind 127.0.0.1 sudah default; `redis-cli ping` → PONG
-- `/opt/secscan`: rsync hasil build (node_modules+standalone) ATAU symlink ke /root/secscan-archived (pilih: build standalone + salin). Pakai pola skill nextjs-deployment.
-- Env: `/opt/secscan/secscan.env` — AUTH_PASSWORD_HASH (bcrypt dari CakraVistaA1), SESSION_SECRET (uuid), REDIS_URL, WORK_DIR, REPORT_DIR, DB_PATH
+- `/opt/secscan`: rsync hasil build (node_modules+standalone) ATAU symlink ke <repo-root> (pilih: build standalone + salin). Pakai pola skill nextjs-deployment.
+- Env: `/opt/secscan/secscan.env` — AUTH_PASSWORD_HASH (bcrypt pilihan sendiri), SESSION_SECRET (uuid), REDIS_URL, WORK_DIR, REPORT_DIR, DB_PATH
 - systemd `secscan.service`: `ExecStart=/usr/bin/node /opt/secscan/standalone/server.js` (atau `npx next start -p 3011`), `EnvironmentFile=/opt/secscan/secscan.env`, Restart=always, User=root
 - systemd `secscan-worker.service`: `ExecStart=/usr/bin/node /opt/secscan/worker.js`, EnvironmentFile sama
-- nginx: server block `secscan.dams.my.id` (HTTP→HTTPS redirect + SSL Let's Encrypt via certbot) → proxy 127.0.0.1:3011 (pattern dash)
+- nginx: server block `<subdomain-scan>` (HTTP→HTTPS redirect + SSL Let's Encrypt via certbot) → proxy 127.0.0.1:3011
 
 - [ ] **Step 1: Install redis-server** — `apt-get install -y redis-server`, `redis-cli ping` → PONG
 - [ ] **Step 2: Build prod** — `npm run build` (standalone output); salin ke /opt/secscan (standalone + static + public + worker.js + node_modules worker deps)
 - [ ] **Step 3: Env + systemd units** — tulis secscan.env (hash bcrypt) + 2 unit file (heredoc ke /etc/systemd/system) + daemon-reload + enable --now
-- [ ] **Step 4: nginx + SSL** — site config (pola dash) → `nginx -t` → reload; `certbot --nginx -d secscan.dams.my.id` (pastikan DNS sudah A record → 43.159.47.123)
-- [ ] **Step 5: Verifikasi** — `curl -I https://secscan.dams.my.id` → 200/302; login flow via https; jalankan 1 job nyata end-to-end
+- [ ] **Step 4: nginx + SSL** — site config → `nginx -t` → reload; `certbot --nginx -d <subdomain-scan>` (pastikan DNS sudah A record ke server)
+- [ ] **Step 5: Verifikasi** — `curl -I https://<subdomain-scan>` → 200/302; login flow via https; jalankan 1 job nyata end-to-end
 - [ ] **Step 6: Rollback note + commit** — dokumentasikan rollback (stop unit, hapus nginx site) + commit deploy notes
 
 ---

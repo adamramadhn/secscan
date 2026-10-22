@@ -40,3 +40,7 @@ Satu aplikasi Next.js 15 (App Router) melayani UI dark-theme dan API (`/api/logi
 - `app/jobs/[id]` — detail job live via SSE + download report
 - `worker.js` — worker BullMQ (proses terpisah)
 - `lib/api.ts` — client fetch wrapper untuk semua endpoint
+
+## License
+
+MIT — lihat LICENSE. Panduan integrasi ke VPS untuk AI agent ada di `AGENTS.md`.
