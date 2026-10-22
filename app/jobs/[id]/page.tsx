@@ -54,10 +54,17 @@ export default function JobDetailPage() {
   const [scheduleName, setScheduleName] = useState('');
   const [scheduleInterval, setScheduleInterval] = useState(1440);
   const [scheduling, setScheduling] = useState(false);
+  const [scheduleConsent, setScheduleConsent] = useState(false);
   const [scheduleError, setScheduleError] = useState<string | null>(null);
+
+  const OFENSIF_SET = new Set(['penetration-testing', 'dast-scanning', 'ai-red-teaming']);
+  const scheduleNeedsConsent = Boolean(
+    job && (job.target_type === 'url' || (job.skills ?? []).some((s) => OFENSIF_SET.has(s)))
+  );
 
   function openScheduleModal() {
     setScheduleError(null);
+    setScheduleConsent(false);
     setScheduleName(
       `Scan ${job?.target_type === 'url' ? 'URL' : (job?.repo_url ?? '').split('/').slice(-1)[0] ?? 'berkala'}`
     );
@@ -82,6 +89,7 @@ export default function JobDetailPage() {
         autoFix: job.auto_fix === 1,
         diffBase: job.diff_base ?? undefined,
         intervalMinutes: scheduleInterval,
+        confirmOfensif: scheduleNeedsConsent ? scheduleConsent : true,
       });
       setScheduleModalOpen(false);
     } catch (err) {
@@ -296,6 +304,21 @@ export default function JobDetailPage() {
                 })}
               </div>
             </div>
+
+            {scheduleNeedsConsent && (
+              <label className="mt-4 flex cursor-pointer items-start gap-2.5 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-200">
+                <input
+                  type="checkbox"
+                  checked={scheduleConsent}
+                  onChange={(e) => setScheduleConsent(e.target.checked)}
+                  className="mt-0.5 h-3.5 w-3.5 rounded border-zinc-700 bg-zinc-900 accent-sky-500"
+                />
+                <span>
+                  Saya mengonfirmasi bahwa target ini milik saya atau saya memiliki wewenang sah untuk memindai dan mengujinya secara berkala.
+                </span>
+              </label>
+            )}
+
             <div className="mt-6 flex justify-end gap-2">
               <button
                 onClick={() => setScheduleModalOpen(false)}
@@ -305,7 +328,11 @@ export default function JobDetailPage() {
               </button>
               <button
                 onClick={handleCreateSchedule}
-                disabled={scheduling || scheduleName.trim().length === 0}
+                disabled={
+                  scheduling ||
+                  scheduleName.trim().length === 0 ||
+                  (scheduleNeedsConsent && !scheduleConsent)
+                }
                 className="rounded-lg bg-sky-500 px-3.5 py-2 text-sm font-semibold text-zinc-950 transition hover:bg-sky-400 disabled:opacity-40"
               >
                 {scheduling ? 'Menyimpan…' : 'Simpan Jadwal'}

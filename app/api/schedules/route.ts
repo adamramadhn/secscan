@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server';
 import { withAuth } from '@/lib/require-auth';
 import { listSchedules, createSchedule } from '@/lib/db';
 import { isValidGithubUrl } from '@/lib/clone';
-import { isValidLiveUrl } from '@/lib/target';
+import { isValidLiveUrl, validateLiveUrlWithDns } from '@/lib/target';
 import { isValidDiffBase } from '@/lib/clone';
 import { getSkill } from '@/lib/skills';
 
@@ -18,6 +18,7 @@ interface ScheduleBody {
   autoFix?: unknown;
   diffBase?: unknown;
   intervalMinutes?: unknown;
+  confirmOfensif?: unknown;
 }
 
 /** GET /api/schedules — daftar semua jadwal. */
@@ -51,16 +52,17 @@ export const POST = withAuth(async (req: Request) => {
 
   // Target: sama aturannya dengan job biasa.
   const targetType = body.targetType === 'url' ? 'url' : 'github';
-  const repoUrl = typeof body.repoUrl === 'string' ? body.repoUrl.trim() : '';
+  let repoUrl = typeof body.repoUrl === 'string' ? body.repoUrl.trim() : '';
   if (targetType === 'github') {
     if (!isValidGithubUrl(repoUrl)) {
       return NextResponse.json({ error: 'invalid_repo_url' }, { status: 400 });
     }
   } else {
-    const live = isValidLiveUrl(repoUrl);
+    const live = await validateLiveUrlWithDns(repoUrl);
     if (!live.ok) {
-      return NextResponse.json({ error: 'invalid_target_url', detail: live.error }, { status: 400 });
+      return NextResponse.json({ error: 'invalid_target_url', detail: live.error, reason: live.detail }, { status: 400 });
     }
+    repoUrl = live.normalized!;
   }
 
   // Skill: minimal 1, semua harus dikenal & sesuai jenis target.
@@ -76,6 +78,18 @@ export const POST = withAuth(async (req: Request) => {
     if (!def) return NextResponse.json({ error: 'unknown_skill', detail: s }, { status: 400 });
     if (targetType === 'url' && def.requiresRepo) {
       return NextResponse.json({ error: 'skill_requires_repo', detail: s }, { status: 400 });
+    }
+  }
+
+  // Penegakan otorisasi/persetujuan target (sama dengan alur job)
+  if (targetType === 'url') {
+    if (body.confirmOfensif !== true) {
+      return NextResponse.json({ error: 'confirm_ofensif_required' }, { status: 400 });
+    }
+  } else {
+    const hasOfensif = skills.some((s) => getSkill(s)?.ofensif === true);
+    if (hasOfensif && body.confirmOfensif !== true) {
+      return NextResponse.json({ error: 'confirm_ofensif_required' }, { status: 400 });
     }
   }
 

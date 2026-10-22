@@ -46,8 +46,38 @@ const BLOCKED_HOSTS = [
 export interface UrlValidation {
   ok: boolean;
   error?: string;
+  detail?: string;
   normalized?: string;
+  resolvedIps?: string[];
 }
+
+import { checkSafeDns } from './dns-check';
+
+export async function validateLiveUrlWithDns(raw: string): Promise<UrlValidation> {
+  const syncCheck = isValidLiveUrl(raw);
+  if (!syncCheck.ok) return syncCheck;
+
+  try {
+    const u = new URL(syncCheck.normalized!);
+    const dnsCheck = await checkSafeDns(u.hostname);
+    if (!dnsCheck.ok) {
+      return {
+        ok: false,
+        error: dnsCheck.error ?? 'dns_check_failed',
+        detail: dnsCheck.reason,
+      };
+    }
+    return {
+      ok: true,
+      normalized: syncCheck.normalized,
+      resolvedIps: dnsCheck.addresses,
+    };
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    return { ok: false, error: 'dns_check_failed', detail: message };
+  }
+}
+
 
 export function isValidLiveUrl(raw: string): UrlValidation {
   if (typeof raw !== 'string' || raw.length === 0) return { ok: false, error: 'empty' };
